@@ -38,20 +38,51 @@ def pad_sequence(sequences, lengths):
     return padded
 
 def to_var(var):
+    """将输入数据转换为PyTorch Variable（自动处理CUDA转移和嵌套数据结构）
+    
+    Args:
+        var: 输入数据，可以是以下类型之一：
+            - torch.Tensor
+            - int/float 标量
+            - dict 字典
+            - list 列表
+    
+    Returns:
+        转换后的Variable或原始数据（保持结构不变）
+        
+    功能说明：
+        1. 对于Tensor：转换为Variable并自动移至GPU（如果可用）
+        2. 对于字典/列表：递归处理所有元素
+        3. 对于标量：原样返回
+    """
+    
+    # 情况1：处理PyTorch Tensor
     if torch.is_tensor(var):
-        var = Variable(var)
+        var = Variable(var)  # 包装为Variable（旧版PyTorch需要，新版可直接用Tensor）
+        
+        # 如果CUDA可用，将数据移至GPU
         if torch.cuda.is_available():
             var = var.cuda()
         return var
+    
+    # 情况2：处理Python标量（直接返回）
     if isinstance(var, int) or isinstance(var, float):
         return var
+    
+    # 情况3：处理字典（递归处理每个值）
     if isinstance(var, dict):
         for key in var:
-            var[key] = to_var(var[key])
+            var[key] = to_var(var[key])  # 递归调用处理每个值
         return var
+    
+    # 情况4：处理列表（递归处理每个元素）
     if isinstance(var, list):
-        var = map(lambda x: to_var(x), var)
+        # 使用map函数处理列表元素（Python2返回list，Python3返回map对象）
+        var = list(map(lambda x: to_var(x), var))  # 显式转换为list保证Python3兼容性
         return var
+    
+    # 注：如果输入是其他类型（如None），将直接返回
+    return var
 
 def get_local_seq(full_seq, kernel_size, mean, std):
     seq_len = full_seq.size()[1]

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from . import GeoConv
 
 class SpatioTemporalNet(nn.Module):
     """
@@ -10,8 +11,7 @@ class SpatioTemporalNet(nn.Module):
         super(SpatioTemporalNet, self).__init__()
 
         # 引入你自己修改的 PathNet（处理 ex, ey 序列）
-        from GeoConv import Net  # 需要替换为你改过的路径模块
-        self.path_net = Net(kernel_size=kernel_size, num_filter=num_filter)
+        self.path_net = GeoConv.Net(kernel_size=kernel_size, num_filter=num_filter)
 
         input_size = num_filter + attr_size  # 不再拼接 +1 (dist_gap)，因为你数据中没有
         hidden_size = 128

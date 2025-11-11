@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import utils
 
-class Attr(nn.Module):
+class Net(nn.Module):
     """
     driverID（离散）
     time（连续）
@@ -22,12 +22,12 @@ class Attr(nn.Module):
     embed_dims = [('driverID', 60000, 16)]  # 可根据实际被试数量修改，最多6W个被试，16维embedding
 
     def __init__(self):
-        super(Attr, self).__init__()
+        super(Net, self).__init__()
         self.build()
 
     def build(self):
         # 构建 driverID embedding
-        for name, dim_in, dim_out in Attr.embed_dims:
+        for name, dim_in, dim_out in Net.embed_dims:
             self.add_module(name + '_em', nn.Embedding(dim_in, dim_out))
 
         # 处理连续特征的线性层
@@ -37,7 +37,7 @@ class Attr(nn.Module):
     def out_size(self):
         # 输出维度 = driverID embedding + 连续特征输出
         sz = 0
-        for name, dim_in, dim_out in Attr.embed_dims:
+        for name, dim_in, dim_out in Net.embed_dims:
             sz += dim_out
         sz += 16  # cont_fc输出维度
         return sz
@@ -57,7 +57,7 @@ class Attr(nn.Module):
         em_list = []
 
         # driverID embedding
-        for name, dim_in, dim_out in Attr.embed_dims:
+        for name, dim_in, dim_out in Net.embed_dims:
             embed = getattr(self, name + '_em')
             attr_t = attr[name].view(-1, 1)
             attr_t = torch.squeeze(embed(attr_t))

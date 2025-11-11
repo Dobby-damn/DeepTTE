@@ -20,10 +20,81 @@ def geo_distance(lon1, lat1, lon2, lat2):
     r = 6371
     return c * r
 
-def normalize(x, key):
-    mean = config[key + '_mean']
-    std = config[key + '_std']
-    return (x - mean) / std
+# def normalize(x, key):
+#     print(key)
+#     mean = config[key + '_mean']
+#     std = config[key + '_std']
+#     return (x - mean) / std
+# utils.py —— 更稳健的 normalize
+import torch
+import numpy as np
+
+def normalize(x, key, config=None, eps=1e-8):
+    """
+    Robust normalize that works for numpy/float/torch.Tensor (CPU/GPU).
+    - x: scalar, numpy array, or torch.Tensor
+    - key: used only for informative error messages (existing code pattern)
+    - config: optional dict providing '<alias>_mean' and '<alias>_std'; if None treat mean=0,std=1
+    """
+    # basic mean/std from config if provided
+    mean = None; std = None
+    if config is not None:
+        # support both 'dist_mean' and 'dis_mean' variations if they exist
+        for base in (key, key[:3], key[:2]):  # small heuristic; adapt if you have synonyms
+            m_k = base + '_mean'
+            s_k = base + '_std'
+            if m_k in config and s_k in config:
+                mean = config[m_k]; std = config[s_k]; break
+        # fallback to direct lookups
+        if mean is None and (key + '_mean') in config:
+            mean = config.get(key + '_mean', torch.mean(x).item())
+            std = config.get(key + '_std', torch.std(x).item() + 1e-6)
+            
+
+    # defaults
+    if mean is None: mean = 0.0
+    if std is None: std = 1.0
+
+    # convert to torch tensor if needed
+    is_tensor = isinstance(x, torch.Tensor)
+    try:
+        if is_tensor:
+            device = x.device
+            x_f = x.float()
+            print("mean:"+str(mean))
+            mean_t = torch.tensor(float(mean), device=device, dtype=x_f.dtype)
+            std_t  = torch.tensor(float(std), device=device, dtype=x_f.dtype)
+            # protect against zero std
+            if torch.abs(std_t) < eps:
+                std_t = std_t + eps
+            y = (x_f - mean_t) / std_t
+
+            # quick sanity: check finite on CPU to avoid device assert hiding
+            if not torch.isfinite(y).all():
+                # move small summary to CPU for readable error
+                y_cpu = y.detach().cpu()
+                raise ValueError(f"normalize produced non-finite values for key={key}: "
+                                 f"y_cpu.min={y_cpu.min().item()}, y_cpu.max={y_cpu.max().item()}, "
+                                 f"x_cpu.min={x.detach().cpu().min().item()}, x_cpu.max={x.detach().cpu().max().item()}, "
+                                 f"mean={mean}, std={std}")
+            return y
+        else:
+            # numpy or scalar
+            x_np = np.array(x, dtype=float)
+            if abs(std) < eps:
+                std = std + eps
+            y = (x_np - float(mean)) / float(std)
+            if not np.isfinite(y).all():
+                raise ValueError(f"normalize produced non-finite for key={key}: min={np.nanmin(y)}, max={np.nanmax(y)}, mean={mean}, std={std}")
+            return y
+    except Exception as e:
+        # give helpful context — move numeric summaries to CPU-readable
+        # If x is tensor, include its device/type/shape
+        ctx = ""
+        if is_tensor:
+            ctx = f" (tensor device={x.device}, dtype={x.dtype}, shape={tuple(x.shape)})"
+        raise RuntimeError(f"normalize failed for key={key}{ctx}: {e}") from e
+
 
 def unnormalize(x, key):
     mean = config[key + '_mean']

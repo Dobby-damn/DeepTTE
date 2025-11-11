@@ -96,6 +96,7 @@ def train(model, elogger, train_set, eval_set):
                 if torch.__version__ < '0.4':
                     attr = {k: Variable(v) for k, v in attr.items()}
                     traj = {k: Variable(v) for k, v in traj.items()}
+                    
 
                 # 前向传播并计算损失
                 '''此处应是前向传播forward，_, loss = model.eval_on_batch(attr, traj, config)'''

@@ -3,7 +3,8 @@
 *.sw*
 *.pkl
 *.npy
-
+*.pt
 #foloders
 logs/*
+
 

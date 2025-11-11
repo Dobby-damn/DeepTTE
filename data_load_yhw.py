@@ -31,6 +31,9 @@ import inspect
 import datetime
 import argparse
 #import data_loader
+from torch.optim import Adam
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, f1_score
 config = json.load(open('./config.json', 'r'))
 
 import torch
@@ -61,78 +64,173 @@ def read_json_array(file_path):
 #############################################dataloader部分#############################################
 class MySet(Dataset):
     def __init__(self, input_file):
+        self.data = []
         # 读取数据文件（每行是一个JSON格式的轨迹记录）
         # self.content = open('./data/' + input_file, 'r').readlines() 
         #这里，我的文件并不是每行一个被试，他是一个被试好几行
         with open(input_file, 'r') as f:
-            self.content = json.load(f)
+            content = json.load(f)
         # 解析JSON数据 
         # self.content = list(map(lambda x: json.loads(x), self.content))
         # 计算每条轨迹的长度（坐标点数量）
-        self.lengths = list(map(lambda x: len(x['ex']), self.content))
+        self.lengths = list(map(lambda x: len(x['ex']), content))
+        for item in content:
+            attr = {
+                'driverID': torch.tensor(item['driverID'], dtype=torch.long),
+                'num_features': torch.tensor([
+                    item['time'],
+                    item['dist'],
+                    item['pause_count'],
+                    item['mean_speed'],
+                    item['curvature_std']
+                ], dtype=torch.float32)
+            }
+            # ---- 轨迹特征（序列部分）----
+            ex = torch.tensor(item['ex'], dtype=torch.float32)
+            ey = torch.tensor(item['ey'], dtype=torch.float32)
+
+            traj = {
+                'lngs': ex,   # 经度序列
+                'lats': ey,   # 纬度序列
+                'lens': torch.tensor(len(ex), dtype=torch.long)
+            }
+            label = torch.tensor(item['label'], dtype=torch.long)
+            driver_id = item['driverID']
+            self.data.append({'attr': attr, 'traj': traj, 'label': label, 'driver_id': driver_id})
+          
+
 
     def __getitem__(self, idx):
         """获取单条轨迹数据"""
-        return self.content[idx]
+        print("这里是getitem函数" + "-----------------")
+        return self.data[idx]
+        item = self.data[idx]
+
+        # ---- 属性特征（非序列部分）----
+        attr = {
+            'driverID': torch.tensor(item['driverID'], dtype=torch.long),
+            'num_features': torch.tensor([
+                item['time'],
+                item['dist'],
+                item['pause_count'],
+                item['mean_speed'],
+                item['curvature_std']
+            ], dtype=torch.float32)
+        }
+        # ---- 轨迹特征（序列部分）----
+        ex = torch.tensor(item['ex'], dtype=torch.float32)
+        ey = torch.tensor(item['ey'], dtype=torch.float32)
+
+        traj = {
+            'lngs': ex,   # 经度序列
+            'lats': ey,   # 纬度序列
+            'lens': torch.tensor(len(ex), dtype=torch.long)
+        }
+        label = torch.tensor(item['label'], dtype=torch.long)
+        driver_id = item['driverID']
+
+        return {'attr': attr, 'traj': traj, 'label': label, 'driver_id': driver_id}
 
     def __len__(self):
         """返回数据集总大小"""
-        return len(self.content)
+        return len(self.data)
+'''
+# def collate_fn(data):
+#     """自定义批处理函数，用于填充变长序列和归一化数据
+#     Args:
+#         data: 一个batch的原始数据列表（每个元素是MySet返回的一条轨迹）
+#     Returns:
+#         attr: 静态属性字典（标准化后的数值特征和类别ID）
+#         traj: 轨迹数据字典（填充后的序列和原始长度）
+#     """
+#     # 需要统计归一化的静态属性
+#     stat_attrs = ['dist', 'time']   # 总距离和总时间
+#     # 类别型ID属性
+#     info_attrs = ['driverID', 'mean_speed', 'pause_count', 'curvature_std']
+#     # 轨迹序列属性
+#     traj_attrs = ['ex', 'ey']
 
-def collate_fn(data):
-    """自定义批处理函数，用于填充变长序列和归一化数据
-    Args:
-        data: 一个batch的原始数据列表（每个元素是MySet返回的一条轨迹）
-    Returns:
-        attr: 静态属性字典（标准化后的数值特征和类别ID）
-        traj: 轨迹数据字典（填充后的序列和原始长度）
-    """
-    # 需要统计归一化的静态属性
-    stat_attrs = ['dist', 'time']   # 总距离和总时间
-    # 类别型ID属性
-    info_attrs = ['driverID', 'mean_speed', 'pause_count', 'curvature_std']
-    # 轨迹序列属性
-    traj_attrs = ['ex', 'ey']
-
-    attr, traj = {}, {}
-    # 获取当前batch中各轨迹的实际长度
-    lens = np.asarray([len(item['ex']) for item in data])
-    # 处理静态数值属性（归一化）
-    for key in stat_attrs:
-        x = torch.FloatTensor([item[key] for item in data])
-        attr[key] = utils.normalize(x, key)   # 均值方差归一化
+#     attr, traj = {}, {}
+#     # 获取当前batch中各轨迹的实际长度
+#     lens = np.asarray([len(item['ex']) for item in data])
+#     # 处理静态数值属性（归一化）
+#     for key in stat_attrs:
+#         x = torch.FloatTensor([item[key] for item in data])
+#         attr[key] = utils.normalize(x, key)   # 均值方差归一化
     
-    # 处理类别型ID属性将其变为长张量 info_attrs=['driverID', 'mean_speed', 'pause-count', 'curvature_std']
-    for key in info_attrs:
-        attr[key] = torch.LongTensor([item[key] for item in data])
+#     # 处理类别型ID属性将其变为长张量 info_attrs=['driverID', 'mean_speed', 'pause-count', 'curvature_std']
+#     for key in info_attrs:
+#         attr[key] = torch.LongTensor([item[key] for item in data])
 
-    # 处理轨迹序列数据（填充变长序列）
-    for key in traj_attrs:
-        # pad to the max length 创建填充矩阵（batch_size x max_len）
-        # seqs = np.asarray([item[key] for item in data])
-        # mask = np.arange(lens.max()) < lens[:, None]   # 生成掩码矩阵（标记有效数据位置）
-        # padded = np.zeros(mask.shape, dtype = np.float32)   # 填充实际数据
-        # padded[mask] = np.concatenate(seqs)   
-        # python2/3兼容性问题，直接构建填充后的张量
-        seqs = [item[key] for item in data]
-        max_len = max(len(seq) for seq in seqs)
-        padded = torch.zeros(len(data), max_len, dtype=torch.float32)
-        for i, seq in enumerate(seqs):
-            padded[i, :len(seq)] = torch.FloatTensor(seq)
-        # 对数值型序列进行归一化
-        if key in ['ex', 'ey']:
-            padded = utils.normalize(padded, key)
+#     # 处理轨迹序列数据（填充变长序列）
+#     for key in traj_attrs:
+#         # pad to the max length 创建填充矩阵（batch_size x max_len）
+#         # seqs = np.asarray([item[key] for item in data])
+#         # mask = np.arange(lens.max()) < lens[:, None]   # 生成掩码矩阵（标记有效数据位置）
+#         # padded = np.zeros(mask.shape, dtype = np.float32)   # 填充实际数据
+#         # padded[mask] = np.concatenate(seqs)   
+#         # python2/3兼容性问题，直接构建填充后的张量
+#         seqs = [item[key] for item in data]
+#         max_len = max(len(seq) for seq in seqs)
+#         padded = torch.zeros(len(data), max_len, dtype=torch.float32)
+#         for i, seq in enumerate(seqs):
+#             padded[i, :len(seq)] = torch.FloatTensor(seq)
+#         # 对数值型序列进行归一化
+#         if key in ['ex', 'ey']:
+#             padded = utils.normalize(padded, key)
 
-        # padded = torch.from_numpy(padded).float()
-        traj[key] = padded
-    # 保存原始长度信息（用于后续处理）
-    lens = [len(item['ex']) for item in data]
-    assert all(l > 0 for l in lens), "存在零长度序列"
-    # lens = lens.tolist()
-    traj['lens'] = torch.tensor(lens, dtype=torch.int64)  # 确保是int64张量
+#         # padded = torch.from_numpy(padded).float()
+#         traj[key] = padded
+#     # 保存原始长度信息（用于后续处理）
+#     lens = [len(item['ex']) for item in data]
+#     assert all(l > 0 for l in lens), "存在零长度序列"
+#     # lens = lens.tolist()
+#     traj['lens'] = torch.tensor(lens, dtype=torch.int64)  # 确保是int64张量
 
-    return attr, traj
+#     return attr, traj
+'''
+def collate_fn(batch):
+    print('这里是批处理函数'+'-----------------')
+    """
+    将 batch 样本打包为模型可接受的格式
+    输出:
+        attr: dict{key: (B, 1) Tensor}
+        traj: dict{'ex': (B,T,1), 'ey': (B,T,1), 'mask': (B,T)}
+        labels: (B,)
+    """
+    # === 属性部分 ===
+    attr_keys = batch[0]['attr'].keys()
+    print("attr_keys:", attr_keys)
+    attr = {
+        k: torch.tensor([b['attr'][k] for b in batch], dtype=torch.float32).unsqueeze(1)
+        for k in attr_keys
+    }
 
+    # === 轨迹部分 ===
+    ex_list = [torch.tensor(b['traj']['ex'], dtype=torch.float32).unsqueeze(-1) for b in batch]
+    ey_list = [torch.tensor(b['traj']['ey'], dtype=torch.float32).unsqueeze(-1) for b in batch]
+
+    ex_pad = pad_sequence(ex_list, batch_first=True)  # (B, T, 1)
+    ey_pad = pad_sequence(ey_list, batch_first=True)  # (B, T, 1)
+
+    lengths = [len(b['traj']['ex']) for b in batch]
+    max_len = max(lengths)
+    mask = torch.zeros(len(batch), max_len)
+    for i, l in enumerate(lengths):
+        mask[i, :l] = 1
+
+    traj = {'ex': ex_pad, 'ey': ey_pad, 'mask': mask}
+
+    # === driverID（如果需要）===
+    driver_ids = torch.tensor([b['driverID'] for b in batch], dtype=torch.long)
+
+    # === 标签 ===
+    labels = torch.tensor([b['label'] for b in batch], dtype=torch.long)
+    print(456)
+    print(attr['driverID'].shape, traj['ex'].shape, labels.shape, driver_ids.shape)
+    print(789)
+
+    return attr, traj, labels, driver_ids
 class BatchSampler:
     """自定义批次采样器，优化变长序列的批处理效率"""
     def __init__(self, dataset, batch_size):
@@ -180,7 +278,7 @@ class BatchSampler:
     def __len__(self):
         return (self.count + self.batch_size - 1) // self.batch_size
 
-def get_loader(file, batch_size, test_ratio= 0.15, val_ratio=0.15, num_workers=4, seed=42):
+def get_loader(file, batch_size, test_ratio= 0.15, val_ratio=0.15, num_workers=0, seed=42):
     """创建数据加载器
     Args:
         file: 文件数据路径
@@ -192,8 +290,10 @@ def get_loader(file, batch_size, test_ratio= 0.15, val_ratio=0.15, num_workers=4
     Returns:
         配置好的DataLoader实例
     """
+    print("即将执行myset函数")
     dataset = MySet(input_file=file)
-    
+    print(dataset.__getitem__(0))
+    print("myset函数执行完毕")
 
     # 按比例划分
     total_size = len(dataset)
@@ -209,30 +309,41 @@ def get_loader(file, batch_size, test_ratio= 0.15, val_ratio=0.15, num_workers=4
     # - batch_size=1 因为批处理已在collate_fn中实现
     # - num_workers=4 使用4个子进程加载数据
     # - pin_memory=True 加速GPU数据传输
+    #
+    print("训练集分割")
     train_loader = DataLoader(
-        dataset=dataset,
-        batch_size=1,  # 实际批次大小由batch_sampler控制
-        collate_fn=collate_fn,  # 使用自定义批处理函数
-        num_workers=4,
-        batch_sampler=BatchSampler(train_set, batch_size),
-        pin_memory=True
+        dataset = train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_fn
     )
+    # train_loader = DataLoader(
+    #     dataset=train_set,
+    #     batch_size=batch_size,  # 实际批次大小由batch_sampler控制
+    #     collate_fn=collate_fn,  # 使用自定义批处理函数
+    #     num_workers=4,
+    #     #batch_sampler=BatchSampler(train_set, batch_size),
+    #     pin_memory=True
+    # )
+    print("验证集分割")
     # 验证集 DataLoader
     val_loader = DataLoader(
         dataset=val_set,
-        batch_size=1,
+        batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=num_workers,
-        batch_sampler=BatchSampler(val_set, batch_size),
+        #batch_sampler=BatchSampler(val_set, batch_size),
         pin_memory=True
     )
+    print("测试集分割")
     # 测试集 DataLoader
     test_loader = DataLoader(
         dataset=test_set,
-        batch_size=1,
+        batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=num_workers,
-        batch_sampler=BatchSampler(test_set, batch_size),
+        #batch_sampler=BatchSampler(test_set, batch_size),
         pin_memory=True
     )
 
@@ -590,98 +701,183 @@ class TrajectoryFeatureExtractor:
         
         return X, y
 
-
-def train(model, elogger, train_loader, val_loader, test_loader, epochs=10, batch_size=32):
-    """训练模型的主函数。
-    Args:
-        model: 待训练的模型
-        elogger: 日志记录器
-        train_loader: 训练集
-        val_loader: 验证集
-        test_loader: 测试集
-        epochs: 训练轮数
-        
+def train(model, elogger, train_loader, val_loader, test_loader, epochs, batch_size, lr=1e-3, device=None):
     """
-    # record the experiment setting
-    elogger.log(str(model))  #记录模型结构
-    # elogger.log(str(args._get_kwargs())) # 记录使用的超参数
+    训练二分类 DeepTTE 模型
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
 
-    # 设置模型为训练模式
-    model.train()
+    # 损失函数与优化器
+    criterion = nn.CrossEntropyLoss()
+    optimizer = Adam(model.parameters(), lr=lr)
 
-    use_cuda = torch.cuda.is_available()
-    if use_cuda:
-        print("使用 GPU 进行训练")
-        model.cuda()
+    best_val_acc = 0.0
 
-    # 使用 Adam 优化器 一种广泛使用的深度学习优化算法 旨在通过计算梯度的一阶矩估计和二阶矩估计来调整每个参数的学习率，从而实现更高效的网络训练。
-    optimizer = optim.Adam(model.parameters(), lr = 1e-3)
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        all_preds, all_labels = [], []
 
-    # 遍历每个 epoch
-    for epoch in range(epochs):
-        print ('Training on epoch {}'.format(epoch))
-        # 遍历训练集中的每个文件
-        
-        # print ('Train on file {}'.format(input_file))
+        pbar = tqdm(train_loader, desc=f"[Epoch {epoch}/{epochs}] Training", leave=False)
+        for attr, traj, labels, driver_ids in pbar:
+            attr = {k: v.to(device) for k, v in attr.items()}
+            traj = {k: v.to(device) for k, v in traj.items()}
+            driver_ids = driver_ids.to(device)
+            labels = labels.to(device)
 
-        # data loader, return two dictionaries, attr and traj获取数据加载器（返回属性 attr 和轨迹 traj）批处理
-        #data_iter = get_loader(file, batch_size)
-
-        running_loss = 0.0   # 累计损失
-
-        # 遍历每个批次
-        for idx, (attr, traj) in enumerate(train_loader):  #此处要求dataset为字典格式。dataloader格式
-            # transform the input to pytorch variable  将数据转换为 PyTorch Variable（兼容旧版本）
-            # attr, traj = utils.to_var(attr), utils.to_var(traj)
-            if use_cuda:
-                attr = {k: v.cuda() if torch.is_tensor(v) else v for k, v in attr.items()}
-                traj = {k: v.cuda() if torch.is_tensor(v) else v for k, v in traj.items()}
-            if torch.__version__ < '0.4':
-                attr = {k: Variable(v) for k, v in attr.items()}
-                traj = {k: Variable(v) for k, v in traj.items()}
-
-            # 前向传播并计算损失
-            '''此处应是前向传播forward_, loss = model.eval_on_batch(attr, traj, config)'''
-            
-            # print('traj:', traj['lens'])
-            print("attr.keys:{}".format(attr.keys()))
-            print("config:{}".format(config))
-            _, loss = model.eval_on_batch(attr, traj, config)
-            '''traj: tensor([125, 122, 114, 111, 110, 108, 107, 104, 104, 103], device='cuda:0')
-            Geo输出： torch.Size([10, 123, 33])
-            属性张良形状 torch.Size([10, 1, 28])
-            扩展属性张量形状 torch.Size([10, 123, 28])
-            拼接后的卷积张量形状 torch.Size([10, 123, 61])
-            '''
-            
-
-            # update the model
-            # 反向传播和优化
             optimizer.zero_grad()
-            '''loss.backward未定义'''
+
+            # forward
+            logits = model(attr, traj, driver_ids)
+            loss = criterion(logits, labels)
+
+            # backward
             loss.backward()
             optimizer.step()
 
-            # 更新累计损失（注意：loss.data[0] 是旧写法，新版本应为 loss.item()）
-            # 损失值获取兼容性
-            if torch.__version__ < '0.4':
-                running_loss += loss.data[0]
-            else:
-                running_loss += loss.item()
+            total_loss += loss.item()
 
-            # 打印训练进度
-            print ('\r Progress {:.2f}%, average loss {}'.format((idx + 1) * 100.0 / len(train_loader), running_loss / (idx + 1.0))),
-            print
-            # 记录当前文件的训练损失
-            elogger.log('Training Epoch {}, Loss {}'.format(epoch, running_loss / (idx + 1.0)))
+            preds = torch.argmax(logits, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
 
-        # evaluate the model after each epoch 每个 epoch 结束后在验证集上评估
-        evaluate(model, elogger, val_loader, save_result = True)
+        train_acc = accuracy_score(all_labels, all_preds)
+        train_loss = total_loss / len(train_loader)
 
-        # save the weight file after each epoch 保存模型权重（文件名包含时间戳）
-        weight_name = '{}_{}'.format('./logs/run_log.log', str(datetime.datetime.now()))
-        elogger.log('Save weight file {}'.format(weight_name))
-        torch.save(model.state_dict(), './saved_weights/' + weight_name)
+        # ===== 验证阶段 =====
+        val_acc, val_f1 = evaluate(model, val_loader, device)
+
+        elogger.log(f"Epoch {epoch}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.4f}, Val Acc={val_acc:.4f}, Val F1={val_f1:.4f}")
+
+        print(f"Epoch [{epoch}/{epochs}] | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
+
+        # 保存最优模型
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), "best_model.pth")
+            elogger.log("✅ Saved new best model")
+
+    # ===== 测试阶段 =====
+    model.load_state_dict(torch.load("best_model.pth"))
+    test_acc, test_f1 = evaluate(model, test_loader, device)
+    elogger.log(f"Test Accuracy={test_acc:.4f}, Test F1={test_f1:.4f}")
+    print(f"\n📊 Final Test Accuracy: {test_acc:.4f}, F1-score: {test_f1:.4f}")
+    elogger.close()
+
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
+    all_preds, all_labels = [], []
+
+    for attr, traj, labels, driver_ids in loader:
+        attr = {k: v.to(device) for k, v in attr.items()}
+        traj = {k: v.to(device) for k, v in traj.items()}
+        driver_ids = driver_ids.to(device)
+        labels = labels.to(device)
+
+        logits = model(attr, traj, driver_ids)
+        preds = torch.argmax(logits, dim=1)
+
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+    acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds)
+    return acc, f1
+# def train(model, elogger, train_loader, val_loader, test_loader, epochs=10, batch_size=32):
+#     """训练模型的主函数。
+#     Args:
+#         model: 待训练的模型
+#         elogger: 日志记录器
+#         train_loader: 训练集
+#         val_loader: 验证集
+#         test_loader: 测试集
+#         epochs: 训练轮数
+        
+#     """
+#     # record the experiment setting
+#     elogger.log(str(model))  #记录模型结构
+#     # elogger.log(str(args._get_kwargs())) # 记录使用的超参数
+
+#     # 设置模型为训练模式
+#     model.train()
+
+#     use_cuda = torch.cuda.is_available()
+#     if use_cuda:
+#         print("使用 GPU 进行训练")
+#         model.cuda()
+
+#     # 使用 Adam 优化器 一种广泛使用的深度学习优化算法 旨在通过计算梯度的一阶矩估计和二阶矩估计来调整每个参数的学习率，从而实现更高效的网络训练。
+#     optimizer = optim.Adam(model.parameters(), lr = 1e-3)
+
+#     # 遍历每个 epoch
+#     for epoch in range(epochs):
+#         print ('Training on epoch {}'.format(epoch))
+#         # 遍历训练集中的每个文件
+        
+#         # print ('Train on file {}'.format(input_file))
+
+#         # data loader, return two dictionaries, attr and traj获取数据加载器（返回属性 attr 和轨迹 traj）批处理
+#         #data_iter = get_loader(file, batch_size)
+
+#         running_loss = 0.0   # 累计损失
+
+#         # 遍历每个批次
+#         for idx, (attr, traj) in enumerate(train_loader):  #此处要求dataset为字典格式。dataloader格式
+#             # transform the input to pytorch variable  将数据转换为 PyTorch Variable（兼容旧版本）
+#             # attr, traj = utils.to_var(attr), utils.to_var(traj)
+#             if use_cuda:
+#                 attr = {k: v.cuda() if torch.is_tensor(v) else v for k, v in attr.items()}
+#                 traj = {k: v.cuda() if torch.is_tensor(v) else v for k, v in traj.items()}
+#             if torch.__version__ < '0.4':
+#                 attr = {k: Variable(v) for k, v in attr.items()}
+#                 traj = {k: Variable(v) for k, v in traj.items()}
+
+#             # 前向传播并计算损失
+#             '''此处应是前向传播forward_, loss = model.eval_on_batch(attr, traj, config)'''
+            
+#             # print('traj:', traj['lens'])
+#             print("attr.keys:{}".format(attr.keys()))
+#             print("config:{}".format(config))
+#             _, loss = model.eval_on_batch(attr, traj, config)
+#             '''traj: tensor([125, 122, 114, 111, 110, 108, 107, 104, 104, 103], device='cuda:0')
+#             Geo输出： torch.Size([10, 123, 33])
+#             属性张良形状 torch.Size([10, 1, 28])
+#             扩展属性张量形状 torch.Size([10, 123, 28])
+#             拼接后的卷积张量形状 torch.Size([10, 123, 61])
+#             '''
+            
+
+#             # update the model
+#             # 反向传播和优化
+#             optimizer.zero_grad()
+#             '''loss.backward未定义'''
+#             loss.backward()
+#             optimizer.step()
+
+#             # 更新累计损失（注意：loss.data[0] 是旧写法，新版本应为 loss.item()）
+#             # 损失值获取兼容性
+#             if torch.__version__ < '0.4':
+#                 running_loss += loss.data[0]
+#             else:
+#                 running_loss += loss.item()
+
+#             # 打印训练进度
+#             print ('\r Progress {:.2f}%, average loss {}'.format((idx + 1) * 100.0 / len(train_loader), running_loss / (idx + 1.0))),
+#             print
+#             # 记录当前文件的训练损失
+#             elogger.log('Training Epoch {}, Loss {}'.format(epoch, running_loss / (idx + 1.0)))
+
+#         # evaluate the model after each epoch 每个 epoch 结束后在验证集上评估
+#         evaluate(model, elogger, val_loader, save_result = True)
+
+#         # save the weight file after each epoch 保存模型权重（文件名包含时间戳）
+#         weight_name = '{}_{}'.format('./logs/run_log.log', str(datetime.datetime.now()))
+#         elogger.log('Save weight file {}'.format(weight_name))
+#         torch.save(model.state_dict(), './saved_weights/' + weight_name)
 
 def write_result(fs, pred_dict, attr):
     """将预测结果写入文件。
@@ -856,10 +1052,10 @@ def main():
     )'''
 
     kernel_size = 3
-    num_filter = 32
+    num_filter = 64     #控制 卷积特征提取层（GeoConv） 的通道数增大 num_filter → 模型容量变强，能提取更复杂的轨迹特征，但显著增加显存和训练时间；减小 num_filter → 模型更轻，速度快但特征表达能力变弱。
     pooling_method = 'attention'
-    num_final_fcs = 3
-    final_fc_size = 128
+    num_fc_layers = 2  #控制 分类器（最终全连接部分） 的层数 增加 分类器表达力增强，可以更好地处理非线性关系；但参数量变多，容易过拟合；减少模型更简单，泛化更稳，但可能欠拟合。
+    hidden_size = 128
     alpha = 0.3
     epochs = 10
     batch_size = 32
@@ -873,14 +1069,24 @@ def main():
     train_loader, val_loader, test_loader = get_loader(file_path, batch_size)   #输出符合预期
     #原来的代码种有训练测试与验证
 
-    first_batch = next(iter(train_loader))   # File "d:\Code\DeepTTE\utils.py", line 24, in normalize    mean = config[key + '_mean']    KeyError: 'dis_mean'
+    #first_batch = next(iter(train_loader))   # File "d:\Code\DeepTTE\utils.py", line 24, in normalize    mean = config[key + '_mean']    KeyError: 'dis_mean'
     # 打印第一个批次的内容（根据你的数据结构，可能是元组、字典等）
-    print("first_batch:{}".format(first_batch))
+    #print("first_batch:{}".format(first_batch))
 
 
    
     # kernel_size = 3, num_filter = 32, pooling_method = 'attention', num_final_fcs = 3, final_fc_size = 128, alpha = 0.3
-    model = models.DeepTTE.Net(kernel_size = 3, num_filter = 32, pooling_method = 'attention', num_final_fcs = 3, final_fc_size = 128, alpha = 0.3)
+    #model = models.DeepTTE.Net(kernel_size = kernel_size, num_filter = num_filter, pooling_method = pooling_method, num_final_fcs = num_final_fcs, final_fc_size = final_fc_size, alpha = alpha)
+
+    model = models.DeepTTE.Net(
+        num_classes = 2, 
+        kernel_size = kernel_size, 
+        num_filter = num_filter, 
+        pooling_method = pooling_method, 
+        hidden_size = hidden_size, 
+        num_fc_layers= num_fc_layers
+    )
+   
     elogger = logger.Logger("run_log")
     
     print("模型创建成功,开始训练...")

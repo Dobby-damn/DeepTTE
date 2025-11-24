@@ -51,23 +51,33 @@ class TrajectoryDataset(Dataset):
         iddiag_path: Path,
         traj_csv_path: Path,
         traj_xlsx_path: Path,
+        traj_path_new: Path,
         X: pd.DataFrame = None, # 传递计算得到的属性特征
     ) -> None:
         # Load diagnostic labels
-        iddiag = pd.read_csv(iddiag_path)
+        iddiag = pd.read_parquet('data.parquet')
+        # 输出diagnose列的类型  
         
-        #筛选出诊断标签为0和1的样本 683个，正常236，异常447
-        iddiag = iddiag[iddiag["diagnose"].isin([0, 1])].copy()
-        self.label_encoder = LabelEncoder()
+
+        
+        #筛选出诊断标签为0和1的样本 个，正常280，异常416？为什么还少了
+        iddiag = iddiag[iddiag["diagnose"].isin([0, 1])].copy()   # 只保留标签为0和1的样本
+        self.label_encoder = LabelEncoder()      
         iddiag["diagnose_encoded"] = self.label_encoder.fit_transform(iddiag["diagnose"])
 
-        label_map = dict(zip(iddiag["evaluation_id"], iddiag["diagnose_encoded"]))
+        label_map = dict(zip(iddiag["evaluation_id"], iddiag["diagnose_encoded"]))  # id与label的映射关系 690条
         print("[Info] 二分类标签分布：\n", iddiag["diagnose_encoded"].value_counts())
         
         # ==== 对静态特征做归一化 ====
+        
         self.eval_ids = X["evaluation_id"].values
-        static_features = X.drop(columns=["evaluation_id"]).values
+        static_features = X.drop(columns=["evaluation_id"]).values     
         self.scaler = StandardScaler()
+        # print(X.columns)
+        # print(X.dtypes)
+        # print("=== Inspect X columns ===")
+        # for col in X.columns:
+        #     print(col, X[col].dtype)
         self.static_features_scaled = self.scaler.fit_transform(static_features)
 
         # 保证 evaluation_id 和归一化后的特征对应
@@ -77,19 +87,20 @@ class TrajectoryDataset(Dataset):
 
         traj1 = pd.read_csv(traj_csv_path, engine="python")
         traj2 = pd.read_excel(traj_xlsx_path)
-        traj = pd.concat([traj1, traj2], ignore_index=True)
+        traj3 = pd.read_csv(traj_path_new)
+        traj = pd.concat([traj1, traj2, traj3], ignore_index=True)   #长度：1462741
         k = 0
 
-        groups = traj.groupby("evaluation_id")
+        groups = traj.groupby("evaluation_id")   #790 groups 
         # ====== 收集样本 ======
         self.samples: List[Tuple[torch.Tensor, int]] = []
         missing_label = 0
         all_coords = []  # 用于存储所有坐标
-        # 此处筛选出191个在轨迹中有而信息学中没有的被试
+
+        # 此处筛选出100个在轨迹中有而信息学中没有的被试
         for  eval_id, df in groups:
             eval_id = float(eval_id)
             if eval_id not in label_map:
-                
                 k += 1
                 continue  # 跳过没有有效标签（或非 0/1 类）的受试者
             label = label_map.get(eval_id)
@@ -97,11 +108,12 @@ class TrajectoryDataset(Dataset):
                 missing_label += 1
                 continue  # skip participants without a label
 
-            coords = df[["ex", "ey"]].values  # 截断到最大长度
+            coords = df[["ex", "ey"]].values  
             all_coords.append(coords)
+        print(f"[Info] 共跳过 {k} 个在轨迹数据中有但在诊断数据中没有的被试。")  #all_coords格式：list，长度690，每个元素是一个(n,2)的numpy数组，n为该被试的轨迹点数。
         
         # ====== 对所有轨迹整体归一化 ======
-        all_coords = np.vstack(all_coords)  # 拼接成大矩阵
+        all_coords = np.vstack(all_coords)  # 拼接成大矩阵  690个样本
         coord_mean = all_coords.mean(axis=0)
         coord_std = all_coords.std(axis=0) + 1e-6  # 防止除0
 
@@ -113,24 +125,16 @@ class TrajectoryDataset(Dataset):
             if label is None:
                 continue
 
-            coords = df[["ex", "ey"]].values[:2048].astype(np.float32)
-
-            # --- 修改1：归一化处理 ---
+            coords = df[["ex", "ey"]].values[:2048].astype(np.float32)    #截断到2048个点
             coords = (coords - coord_mean) / coord_std
-
-            # --- 修改2：NaN/Inf 检查 ---
             coords = np.nan_to_num(coords, nan=0.0, posinf=0.0, neginf=0.0)
-
             coords = torch.tensor(coords, dtype=torch.float32)
-            static_feat = torch.tensor(self.static_map[eval_id], dtype=torch.float32)
 
-            # --- 修改3：静态特征 NaN/Inf 检查 ---
+            static_feat = torch.tensor(self.static_map[eval_id], dtype=torch.float32)
             static_feat = torch.nan_to_num(static_feat, nan=0.0, posinf=0.0, neginf=0.0)
 
             self.samples.append((coords, static_feat, int(label)))
-            # coords = torch.tensor(coords, dtype=torch.float32)
-            # static_feat = torch.tensor(self.static_map[eval_id], dtype=torch.float32)
-            # self.samples.append((coords, static_feat, int(label)))
+          
         if missing_label:
             print(f"[Info] Skipped {missing_label} participants without labels.")
 
@@ -138,9 +142,31 @@ class TrajectoryDataset(Dataset):
         """Return number of participants available."""
         return len(self.samples)
 
+
     def __getitem__(self, idx: int):  # noqa: D401, D403
+        def compute_motion_features(coords):
+            # coords: (seq_len, 2)  ex, ey
+            x = coords[:, 0]
+            y = coords[:, 1]
+
+            # 一阶差分（速度）
+            dx = torch.diff(x, prepend=x[:1])
+            dy = torch.diff(y, prepend=y[:1])
+            speed = torch.sqrt(dx**2 + dy**2)
+
+            # 二阶差分（加速度）
+            ax = torch.diff(dx, prepend=dx[:1])
+            ay = torch.diff(dy, prepend=dy[:1])
+
+            # 方向 & 转向角速度
+            heading = torch.atan2(dy, dx)
+            turn_rate = torch.diff(heading, prepend=heading[:1])
+
+            return torch.stack([dx, dy, speed, ax, ay, heading, turn_rate], dim=1)
         # return self.samples[idx]
         coords, static_feat, label = self.samples[idx]
+        motion_feat = compute_motion_features(coords)  # [seq, 7]
+        coords = torch.cat([coords, motion_feat], dim=1)
         return coords, static_feat, label
 
 
@@ -211,13 +237,13 @@ class CosineAnnealingWarmRestarts(_LRScheduler):
 class LSTMClassifier(nn.Module):
     def __init__(
         self,       
-        input_size: int = 2,    # 轨迹点 (ex, ey)
-        static_dim: int = 20,   # 属性特征维度
+        input_size: int = 9,    # 轨迹点 (ex, ey)
+        static_dim: int = 67,   # 属性特征维度
         hidden_size: int = 128,
         num_layers: int = 2,
         num_classes: int = 2,
         dropout: float = 0.2,
-        bidirectional: bool = False,
+        bidirectional: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -235,17 +261,23 @@ class LSTMClassifier(nn.Module):
         )
 
         # Attention 层
-        self.attn = nn.Sequential(
-            nn.Linear(hidden_size * self.num_directions, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, 1, bias=False)
+        # self.attn = nn.Sequential(
+        #     nn.Linear(hidden_size * self.num_directions, hidden_size),
+        #     nn.Tanh(),
+        #     nn.Linear(hidden_size, 1, bias=False)
+        # )
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_size * self.num_directions,
+            num_heads=4,
+            dropout=0.1,
+            batch_first=True
         )
 
         # 静态特征 MLP
         self.fc_static = nn.Sequential(
             nn.Linear(static_dim, hidden_size),
             nn.ReLU(),
-            nn.Dropout(0.3)
+            nn.Dropout(0.5)
         )
 
         # 分类层：拼接时序和静态 embedding
@@ -268,29 +300,61 @@ class LSTMClassifier(nn.Module):
         # )
 
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor, static_feat):
-        # Pack padded sequence
-        packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        packed_out, _ = self.lstm(packed)
-        lstm_out, _ = pad_packed_sequence(packed_out, batch_first=True)
+    # def forward(self, x: torch.Tensor, lengths: torch.Tensor, static_feat):
+    #     # Pack padded sequence
+    #     packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+    #     packed_out, _ = self.lstm(packed)
+    #     lstm_out, _ = pad_packed_sequence(packed_out, batch_first=True)
 
-        # Attention: compute weights for each time step
-        attn_weights = self.attn(lstm_out).squeeze(-1)  # (batch, seq_len)
-        # Mask attention weights to ignore padded time steps
-        mask = torch.arange(lstm_out.size(1), device=lengths.device)[None, :] < lengths[:, None]
-        attn_weights[~mask] = -1e9  # mask out padding
-        attn_weights = attn_weights - attn_weights.max(dim=1, keepdim=True)[0]  # 防溢出
-        attn_scores = torch.softmax(attn_weights, dim=1)  # (batch, seq_len)
+    #     # Attention: compute weights for each time step
+    #     attn_weights = self.attn(lstm_out).squeeze(-1)  # (batch, seq_len)
+    #     # Mask attention weights to ignore padded time steps
+    #     mask = torch.arange(lstm_out.size(1), device=lengths.device)[None, :] < lengths[:, None]
+    #     attn_weights = attn_weights.masked_fill(~mask, -1e4)  # mask out padding
+    #     attn_weights = attn_weights - attn_weights.max(dim=1, keepdim=True)[0]  # 防溢出
+    #     attn_scores = torch.softmax(attn_weights, dim=1)  # (batch, seq_len)
 
-        # Compute context vector (weighted sum of lstm outputs)
-        context = torch.sum(lstm_out * attn_scores.unsqueeze(-1), dim=1)  # (batch, hidden*2)
+    #     # Compute context vector (weighted sum of lstm outputs)
+    #     context = torch.sum(lstm_out * attn_scores.unsqueeze(-1), dim=1)  # (batch, hidden*2)
         
-        # 静态特征编码
-        static_vec = self.fc_static(static_feat)
+    #     # 静态特征编码
+    #     static_vec = self.fc_static(static_feat)
 
-        # 拼接
-        combined = torch.cat([context, static_vec], dim=-1)
-        logits = self.fc(combined)  # (batch, num_classes)
+    #     # 拼接
+    #     combined = torch.cat([context, static_vec], dim=-1)
+    #     logits = self.fc(combined)  # (batch, num_classes)
+    #     return logits
+    def forward(self, x, lengths, static_feats):
+        # x: (batch, seq, 2)
+
+        # ----- 1. pack -----
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        packed_out, _ = self.lstm(packed)
+
+        # ----- 2. unpack -----
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_out, batch_first=True
+        )  # (batch, seq, 2*hidden)
+
+        # ----- 3. Multi-Head Attention -----
+        # Q = K = V = lstm_out
+        attn_out, _ = self.attn(lstm_out, lstm_out, lstm_out)
+        # (batch, seq, 2*hidden)
+
+        # ----- 4. 序列池化（取平均 or 最大）-----
+        seq_repr = attn_out.mean(dim=1)  # (batch, 2*hidden)
+
+        # ----- 5. 静态特征 MLP -----
+        static_vec = self.fc_static(static_feats)  # (batch, 32)
+
+        # ----- 6. 融合 -----
+        fused = torch.cat([seq_repr, static_vec], dim=1)
+
+        # ----- 7. 分类 -----
+        logits = self.fc(fused)
+
         return logits
 
 
@@ -322,7 +386,6 @@ def train_epoch(model, loader, criterion, optimizer, device):
 
 
 @torch.no_grad()
-
 
 def eval_epoch(model, loader, criterion, device):
     model.eval()
@@ -377,37 +440,78 @@ def find_best_threshold(probs, y_true, metric="f1"):  # metric: 'f1' 以正类F1
 
 def main():  # noqa: D401
     # ------------------------------ Paths & Hyper‑parameters -----------------------------
-    # data_dir = Path("LSTM")
-    iddiag_path = r"D:/Code/DeepTTE/LSTM/iddiag.csv"
-    traj_csv_path = r"D:/Code/DeepTTE/LSTM/连线测试轨迹(1).csv"
-    traj_xlsx_path = r"D:/Code/DeepTTE/LSTM/连线测试轨迹(2).xlsx"
+    data_dir = Path("LSTM")
+    id_path = r"D:/Code/DeepTTE/data/iddiag.csv"    # 身份id"video",age,sex,,edu_year,habit,label
+    iddiag_path = r"D:/Code/DeepTTE/data/连线测试.csv"       # 其他的一些特征
+    traj_csv_path = r"D:/Code/DeepTTE/data/连线测试轨迹(1).csv"    #轨迹1
+    traj_xlsx_path = r"D:/Code/DeepTTE/data/连线测试轨迹(2).xlsx"   #轨迹2
+     # 新增的诊断文件和轨迹文件
+    id_path_new = r"D:/Code/DeepTTE/data/体检id.xlsx"       # o列是ID F列是MoCA分数
+    iddiag_path_new = r"D:/Code/DeepTTE/data/连线测试体检.csv"      # 其他的一些特征
+    traj_path_new = r"D:/Code/DeepTTE/data/连线测试轨迹体检.csv"    # 轨迹特征
 
-    # 获取属性特征，edu_year, sex, age ,mean_speed etlc.
-    extractor = TrajectoryFeatureExtractor(iddiag_path, traj_csv_path, traj_xlsx_path)
-    X, y = extractor.get_feature_matrix_and_target()
+    # # 获取属性特征，edu_year, sex, age ,mean_speed etlc.    我的目标：将所有的特征整合为一个打的dataframe变量。（储存到csv中？）
+    # extractor = TrajectoryFeatureExtractor(id_path, iddiag_path, traj_csv_path, traj_xlsx_path, id_path_new, iddiag_path_new, traj_path_new)
+    # X, y = extractor.get_feature_matrix_and_target() #这里返回的是DataFrame格式
+
     # print(X.head())
-    print(y.head())
+    df = pd.read_parquet('data.parquet')
+    # features = [
+    #     'age', 'edu_year',  # 人口统计'edu_year','sex'
+    #     'mean_speed', 'std_speed', 'total_distance',  # 轨迹特征
+    #     'total_time', 'pause_count', 'speed_variation', 'point_count',
+    #     'mean_curvature', 'max_curvature', 'curvature_std', 'high_curvature_points',  # 曲率特征
+    #     'complexity_ratio', 'direction_changes', 'mean_acceleration',
+    #     'jerk_std', 'max_pause_duration', 'pause_time_ratio', 'evaluation_id',
+    # ]
 
-    batch_size = 64
+    x = df.drop(columns=['video','id','birthdate','game_code','save_time','create_time','update_time','touchDuration','numberInterval','name','Unnamed: 2'])  # 删除诊断标签和ID列，只保留特征
+    
+    feature_names = x.columns.tolist()
+    # print("初始特征列表：", feature_names)
+    # for feature_name in feature_names:
+        # assert feature_name in x.columns, f"{feature_name} 不在特征列表中!"
+    X = x#.drop(columns=['Unnamed: 0']).copy()
+        # print(X.columns.tolist())
+        
+
+
+    batch_size = 32
     hidden_size = 64
-    num_epochs = 1000
+    static_dim = 68  # 属性特征维度
+    num_epochs = 30
     learning_rate = 3e-4
-    dropout = 0.2
-    input_size = 2  # 2（ex, ey）
+    dropout = 0.3
+    input_size = 9  # 2（ex, ey）
     num_layers = 3 #LSTM 层数
 
     # ----------------------------------- Dataset ---------------------------------------
-    dataset = TrajectoryDataset(iddiag_path, traj_csv_path, traj_xlsx_path, X)
+    dataset = TrajectoryDataset('data.parquet', traj_csv_path, traj_xlsx_path, traj_path_new, X)
     
     labels = [lbl for *_, lbl in dataset.samples]
-    train_idx, val_idx = train_test_split(
-        np.arange(
-            len(dataset)), 
-            test_size = 0.2, 
-            random_state = 5, 
-            stratify = labels
+    # train_idx, val_idx = train_test_split(
+    #     np.arange(
+    #         len(dataset)), 
+    #         test_size = 0.2, 
+    #         random_state = 5, 
+    #         stratify = labels
+    # )
+    # 0.7/0.15/0.15 划分训练/验证/测试集
+    train_idx, temp_idx = train_test_split(
+        np.arange(len(dataset)),
+        test_size=0.3,
+        random_state=10,
+        stratify=labels             # 按标签比例分层抽样
     )
-    train_sampler = BucketBatchSampler(torch.utils.data.Subset(dataset, train_idx), batch_size)
+
+    val_idx, test_idx = train_test_split(
+        temp_idx,
+        test_size=0.5,
+        random_state=10,
+        stratify=[labels[i] for i in temp_idx]
+    )
+    train_sampler = BucketBatchSampler(torch.utils.data.Subset(dataset, train_idx), batch_size) #按照长度分组
+
     train_loader = DataLoader(
         dataset,
         batch_sampler = train_sampler,
@@ -421,36 +525,44 @@ def main():  # noqa: D401
         shuffle = False,
         collate_fn = collate_fn,
     )
-
+    test_loader = DataLoader(
+        torch.utils.data.Subset(dataset, test_idx),
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+    )
+    
     # ---------------------------------- Model & Optim ----------------------------------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = len(dataset.label_encoder.classes_)
+    torch.backends.cudnn.enabled = False
     model = LSTMClassifier(
         input_size = input_size,
+        static_dim = static_dim,
         hidden_size = hidden_size,
         num_layers = num_layers,
         num_classes = num_classes,
         dropout = dropout,
     ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)  # 初始学习率
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)  # 初始学习率 L2正则化
 
-    # 余弦退火参数设置
-    scheduler = CosineAnnealingWarmRestarts(
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        T_0 = 30,          # 初始周期长度（epoch数）
-        T_mult = 2,        # 每次重启后周期倍增
-        eta_min = 1e-5     # 最小学习率
+        mode="min",
+        factor=0.5,
+        patience=10,
+        min_lr=1e-6
     )
         
 
-    #  为 CrossEntropyLoss 添加类别权重，这能显著抑制模型倾向于预测“异常”，从而提高对“正常”的识别率。##################################################
+    #  为 CrossEntropyLoss 添加类别权重，这能显著抑制模型倾向于预测“异常”，从而提高对“正常”的识别率。#########################
     class_counts = np.bincount(labels)  # [236, 447]
     weights = 1.0 / torch.tensor(class_counts, dtype=torch.float32)
     weights = weights / weights.sum()  # 归一化为 1
     criterion = nn.CrossEntropyLoss(weight=weights.to(device))
     ######################################################################################################
     # criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     # ------------------------------- Training Loop -------------------------------------
     history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
@@ -470,7 +582,7 @@ def main():  # noqa: D401
         history.setdefault("f1_score", []).append(f1)
         history.setdefault("f1_score_class0", []).append(f1_class0)
 
-        scheduler.step()  # 每个epoch更新学习率
+        scheduler.step(val_loss)  # 每个epoch更新学习率
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch}, LR: {current_lr:.6f}")
 
@@ -493,9 +605,12 @@ def main():  # noqa: D401
             print(f"[Checkpoint] Saved improved model to {ckpt_path}")
     epochs = range(1, num_epochs + 1)
 
-    _, _, _, _, auc, _, val_probs, val_targets = eval_epoch(model, val_loader, criterion, device)
+    # _, _, _, _, auc, _, val_probs, val_targets = eval_epoch(model, val_loader, criterion, device)
+    print("\n===== Running final test evaluation =====")
+    test_loss, test_acc, test_f1, test_f1_class0, test_auc, _, val_probs, val_targets = eval_epoch(model, test_loader, criterion, device)
     best_thr, best_f1 = find_best_threshold(val_probs, val_targets, metric="f1")
-    print(f"[Val] AUC={auc:.3f} | Best F1(1)={best_f1:.3f} at threshold={best_thr:.3f}")
+    print(f"Best F1(1)={best_f1:.3f} at threshold={best_thr:.3f}")
+    print(f"[TEST] loss={test_loss:.4f}, acc={test_acc:.4f}, "f"f1={test_f1:.4f}, auc={test_auc:.4f}")
 
     plt.figure()
     plt.plot(epochs, history["train_loss"], label="Training loss")
@@ -519,13 +634,20 @@ def main():  # noqa: D401
     plt.figure()
     plt.plot(epochs, history["f1_score"], label="F1 score")
     plt.plot(epochs, history["f1_score_class0"], label="F1 score normal")
-    plt.xlabel("Epoch")
+    plt.xlabel(f"[TEST] loss={test_loss:.4f}, acc={test_acc:.4f}, "f"f1={test_f1:.4f}, auc={test_auc:.4f}")
     plt.ylabel("f1 score")
     plt.legend()
     plt.tight_layout()
     plt.savefig("f1_score_curve.png")
 
     print("Training finished. Curves saved as loss_curve.png & accuracy_curve.png")
+    del model
+    del optimizer
+    del train_loader
+    del val_loader
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    
 
 
 if __name__ == "__main__":

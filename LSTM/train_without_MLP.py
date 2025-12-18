@@ -270,107 +270,99 @@ class CosineAnnealingWarmRestarts(_LRScheduler):
                 for base_lr in self.base_lrs]
 
 
-class CNNClassifier(nn.Module):
+class LSTMClassifier(nn.Module):
     def __init__(
-        self,
-        input_size: int = 9,      # 轨迹点特征维度 (ex, ey, ...)
-        static_dim: int = 67,     # 静态属性维度
-        num_classes: int = 2,     # 分类数量
-        cnn_channels: list = [64, 128, 256], # CNN每一层的通道数
-        kernel_size: int = 3,     # 卷积核大小
-        dropout: float = 0.3
+        self,       
+        input_size: int = 9,    # 轨迹点 (ex, ey)
+        static_dim: int = 67,   # 属性特征维度
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        num_classes: int = 2,
+        dropout: float = 0.2,
+        bidirectional: bool = True,
     ) -> None:
         super().__init__()
-        
-        # --- 1. 时序 CNN 分支 ---
-        # 构建多层 1D 卷积
-        layers = []
-        in_channels = input_size
-        
-        for out_channels in cnn_channels:
-            layers.append(nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=kernel_size//2))
-            layers.append(nn.BatchNorm1d(out_channels))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout))
-            in_channels = out_channels
-            
-        self.cnn_extractor = nn.Sequential(*layers)
-        
-        # 全局池化层：将任意长度的序列 (Batch, Channels, Seq) -> (Batch, Channels, 1)
-        # 这里使用 MaxPool，通常对捕捉轨迹中的"显著异常"或"关键转折"较好
-        self.global_pool = nn.AdaptiveMaxPool1d(1)
-        
-        cnn_out_dim = cnn_channels[-1] # 最后一层卷积的通道数，例如 256
+        self.hidden_size = hidden_size
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
 
-        # --- 2. 静态特征 MLP 分支 (保持与LSTM一致) ---
-        static_hidden_dim = 128
+        # 时序 LSTM
+        self.lstm = nn.LSTM(
+            input_size,
+            hidden_size,
+            num_layers=num_layers,
+            bidirectional=self.bidirectional,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        # Attention 层
+        # self.attn = nn.Sequential(
+        #     nn.Linear(hidden_size * self.num_directions, hidden_size),
+        #     nn.Tanh(),
+        #     nn.Linear(hidden_size, 1, bias=False)
+        # )
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_size * self.num_directions,
+            num_heads=4,
+            dropout=0.3,
+            batch_first=True
+        )
+
+        # 静态特征 MLP
         self.fc_static = nn.Sequential(
-            nn.Linear(static_dim, static_hidden_dim),
+            nn.Linear(static_dim, hidden_size),
             nn.ReLU(),
             nn.Dropout(0.5)
         )
 
-        # --- 3. 融合与分类层 ---
-        # 拼接维度 = CNN输出维度 + 静态特征维度
-        combined_dim = cnn_out_dim + static_hidden_dim
-        
+        # 分类层：拼接时序和静态 embedding
+        combined_dim = hidden_size * self.num_directions
         self.fc = nn.Sequential(
-            nn.Linear(combined_dim, 128),
+            nn.Linear(combined_dim, hidden_size),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
+            nn.Linear(hidden_size, num_classes)
         )
-
-    def forward(self, x, lengths, static_feats):
-        """
-        参数与 LSTMClassifier 保持完全一致，方便替换
-        x: (batch, seq, input_size)
-        lengths: (batch) - CNN通常不需要lengths，因为有Padding和Pooling，但为了接口兼容保留
-        static_feats: (batch, static_dim)
-        """
-        
-        # ----- 1. 时序特征提取 (CNN) -----
-        # 变换维度：(Batch, Seq, Input) -> (Batch, Input, Seq)
-        # PyTorch Conv1d 要求 Channel 在第1维
-        x_permuted = x.permute(0, 2, 1) 
-        
-        # 卷积提取特征
-        feat_map = self.cnn_extractor(x_permuted) # -> (Batch, 256, Seq)
-        
-        # 全局池化 (处理变长序列的关键)
-        # 无论 Seq 是多少，输出都是 (Batch, 256, 1)
-        seq_repr = self.global_pool(feat_map)
-        
-        # 展平: (Batch, 256)
-        seq_repr = seq_repr.squeeze(-1)
-
-        # ----- 2. 静态特征提取 -----
-        static_vec = self.fc_static(static_feats) # -> (Batch, 128)
-
-        # ----- 3. 融合 -----
-        fused = torch.cat([seq_repr, static_vec], dim=1) # -> (Batch, 384)
-
-        # ----- 4. 分类 -----
-        logits = self.fc(fused)
-
-        return logits
 
     def forward_static_only(self, static_feats):
         """
-        仅用静态特征进行推理（用于 SHAP 归因分析等）
+        仅用静态特征进行推理（用于 SHAP）
         """
         # 1. 静态特征 MLP
-        static_out = self.fc_static(static_feats)   # [N, 128]
+        static_out = self.fc_static(static_feats)   # [N, 64]
+        # 2. Dummy 序列向量（全部为零），保持原维度一致
+        dummy_seq = torch.zeros(static_feats.size(0), 128, device=static_feats.device)  # [N, 128]
+        # 3. 拼接 (静态64 + 序列128 = 192)
+        fused = torch.cat([static_out, dummy_seq], dim=1)
+        # 4. 全连接层（模型原始的分类头）
+        logits = self.fc(fused)
+
+        return logits
         
-        # 2. Dummy 序列向量（全部为零）
-        # 需要与 CNN 输出维度一致 (例如 256)
-        cnn_out_dim = self.cnn_extractor[-4].out_channels # 获取最后一层卷积的通道数
-        dummy_seq = torch.zeros(static_feats.size(0), cnn_out_dim, device=static_feats.device)
-        
-        # 3. 拼接
-        fused = torch.cat([dummy_seq, static_out], dim=1)
-        
-        # 4. 全连接层
+
+    def forward(self, x, lengths, static_feats):
+        # x: (batch, seq, 2)
+        # ----- 1. pack -----
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        packed_out, _ = self.lstm(packed)
+        # ----- 2. unpack -----
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_out, batch_first=True
+        )  # (batch, seq, 2*hidden)
+        # ----- 3. Multi-Head Attention -----
+        # Q = K = V = lstm_out
+        attn_out, _ = self.attn(lstm_out, lstm_out, lstm_out)
+        # (batch, seq, 2*hidden)
+        # ----- 4. 序列池化（取平均 or 最大）-----
+        seq_repr = attn_out.mean(dim=1)  # (batch, 2*hidden)
+        # ----- 5. 静态特征 MLP -----
+        static_vec = self.fc_static(static_feats)  # (batch, 32)
+        # ----- 6. 融合 -----
+        fused = seq_repr
+        # ----- 7. 分类 -----
         logits = self.fc(fused)
 
         return logits
@@ -398,6 +390,8 @@ def train_epoch(model, loader, criterion, optimizer, device):
         preds = logits.argmax(dim=1)
         correct += (preds == y).sum().item()
         total += y.size(0)
+        # print("x device:", x.device)  # 应输出 cuda:0
+        # print("model device:", next(model.parameters()).device)  # 应输出 cuda:0
     return epoch_loss / total, correct / total
 
 
@@ -466,8 +460,20 @@ def main():
     iddiag_path_new = r"D:/Code/DeepTTE/data/连线测试体检.csv"      # 其他的一些特征
     traj_path_new = r"D:/Code/DeepTTE/data/连线测试轨迹体检.csv"    # 轨迹特征
 
+    # # 获取属性特征，edu_year, sex, age ,mean_speed etlc.    我的目标：将所有的特征整合为一个打的dataframe变量。（储存到csv中？）
+    # extractor = TrajectoryFeatureExtractor(id_path, iddiag_path, traj_csv_path, traj_xlsx_path, id_path_new, iddiag_path_new, traj_path_new)
+    # X, y = extractor.get_feature_matrix_and_target() #这里返回的是DataFrame格式
+
     # print(X.head())
     df = pd.read_parquet('data.parquet')
+    # features = [
+    #     'age', 'edu_year',  # 人口统计'edu_year','sex'
+    #     'mean_speed', 'std_speed', 'total_distance',  # 轨迹特征
+    #     'total_time', 'pause_count', 'speed_variation', 'point_count',
+    #     'mean_curvature', 'max_curvature', 'curvature_std', 'high_curvature_points',  # 曲率特征
+    #     'complexity_ratio', 'direction_changes', 'mean_acceleration',
+    #     'jerk_std', 'max_pause_duration', 'pause_time_ratio', 'evaluation_id',
+    # ]
 
     x = df.drop(columns=['video','hkbcscore','moca_s','moca_score','diagnose','id','birthdate','game_code','save_time','create_time','update_time','touchDuration','numberInterval','name','Unnamed: 2'])  # 删除无关列
     print("初始特征",x.columns.tolist())
@@ -479,12 +485,16 @@ def main():
 
     feature_names = x.columns.tolist()
     print("初始特征列表：", feature_names)
-
+    # for feature_name in feature_names:
+        # assert feature_name in x.columns, f"{feature_name} 不在特征列表中!"
     X = x#.drop(columns=['Unnamed: 0']).copy()
+        # print(X.columns.tolist())
+        
+
 
     batch_size = 32
     hidden_size = 64
-    num_epochs = 200
+    num_epochs = 70
     learning_rate = 3e-4
     dropout = 0.4
     input_size = 9  # 2（ex, ey）
@@ -494,8 +504,14 @@ def main():
     dataset = TrajectoryDataset('data.parquet', traj_csv_path, traj_xlsx_path, traj_path_new, X)
     
     labels = [lbl for *_, lbl in dataset.samples]
-
-    # 0.6/0.2/0.2 划分训练/验证/测试集
+    # train_idx, val_idx = train_test_split(
+    #     np.arange(
+    #         len(dataset)), 
+    #         test_size = 0.2, 
+    #         random_state = 5, 
+    #         stratify = labels
+    # )
+    # 0.7/0.15/0.15 划分训练/验证/测试集
     train_idx, temp_idx = train_test_split(
         np.arange(len(dataset)),
         test_size=0.3,
@@ -514,6 +530,8 @@ def main():
     train_loader = DataLoader(
         dataset,
         batch_sampler = train_sampler,
+        # batch_size = batch_size,
+        # shuffle = True,
         collate_fn = collate_fn,
     )
     val_loader = DataLoader(
@@ -536,20 +554,14 @@ def main():
     # infer static feature dimension from dataset (prevents mismatch / leakage)
     inferred_static_dim = int(dataset.static_features_scaled.shape[1])
     print(f"[Info] Inferred static feature dim: {inferred_static_dim}")
-    # model = LSTMClassifier(
-    #     input_size = input_size,
-    #     static_dim = inferred_static_dim,
-    #     hidden_size = hidden_size,
-    #     num_layers = num_layers,
-    #     num_classes = num_classes,
-    #     dropout = dropout,
-    # ).to(device)
-    model = CNNClassifier(
-        input_size=input_size, 
-        static_dim=inferred_static_dim, 
-        cnn_channels=[64, 128, 256], # 可选：控制网络深度和宽度
-        dropout=dropout
-    ) .to(device)
+    model = LSTMClassifier(
+        input_size = input_size,
+        static_dim = inferred_static_dim,
+        hidden_size = hidden_size,
+        num_layers = num_layers,
+        num_classes = num_classes,
+        dropout = dropout,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)  # 初始学习率 L2正则化
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -561,11 +573,14 @@ def main():
     )
         
 
-    #  为 CrossEntropyLoss 添加类别权重，这能显著抑制模型倾向于预测“异常”，从而提高对“正常”的识别率。
+    #  为 CrossEntropyLoss 添加类别权重，这能显著抑制模型倾向于预测“异常”，从而提高对“正常”的识别率。#########################
     class_counts = np.bincount(labels)  # [236, 447]
     weights = 1.0 / torch.tensor(class_counts, dtype=torch.float32)
     weights = weights / weights.sum()  # 归一化为 1
     criterion = nn.CrossEntropyLoss(weight=weights.to(device))
+    ######################################################################################################
+    # criterion = nn.CrossEntropyLoss()
+    # optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     # ------------------------------- Training Loop -------------------------------------
     history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
@@ -647,9 +662,11 @@ def main():
     del model
     del optimizer
     del train_loader
+    del test_loader
     del val_loader
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
+
 
 if __name__ == "__main__":
     main()

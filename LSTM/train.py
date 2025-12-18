@@ -43,6 +43,34 @@ from data_get import TrajectoryFeatureExtractor
 # print("当前GPU名称：", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "无GPU")
 
 
+class ShapWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        
+    def forward(self, full_input):
+        """
+        full_input: (batch, seq_len + static_dim)
+        你需要将其拆分回 x, lengths, static_feats
+        """
+        batch = full_input.shape[0]
+
+        seq_len = 2048 * 2    # 每个点两个维度
+        static_dim = 68      # 根据你的数据而定
+
+        # 1. 还原轨迹
+        x = full_input[:, :seq_len]
+        x = x.view(batch, 2048, 2)
+
+        # 2. 还原静态特征
+        static_feats = full_input[:, seq_len: seq_len + static_dim]
+
+        # 3. 你需要提供长度（用真实的）
+        lengths = torch.full((batch,), 2048, dtype=torch.int64).to(x.device)
+
+        return self.model(x, lengths, static_feats)
+
+
 class TrajectoryDataset(Dataset):
     """Dataset that groups (ex, ey) clicks per evaluation_id and attaches a label."""
 
@@ -109,13 +137,22 @@ class TrajectoryDataset(Dataset):
                 continue  # skip participants without a label
 
             coords = df[["ex", "ey"]].values  
+            if coords.size == 0:
+                # skip empty trajectories
+                k += 1
+                continue
             all_coords.append(coords)
         print(f"[Info] 共跳过 {k} 个在轨迹数据中有但在诊断数据中没有的被试。")  #all_coords格式：list，长度690，每个元素是一个(n,2)的numpy数组，n为该被试的轨迹点数。
         
         # ====== 对所有轨迹整体归一化 ======
-        all_coords = np.vstack(all_coords)  # 拼接成大矩阵  690个样本
-        coord_mean = all_coords.mean(axis=0)
-        coord_std = all_coords.std(axis=0) + 1e-6  # 防止除0
+        if len(all_coords) == 0:
+            # no trajectories found -> create dummy mean/std
+            coord_mean = np.array([0.0, 0.0], dtype=np.float32)
+            coord_std = np.array([1.0, 1.0], dtype=np.float32)
+        else:
+            all_coords = np.vstack(all_coords)  # 拼接成大矩阵
+            coord_mean = all_coords.mean(axis=0)
+            coord_std = all_coords.std(axis=0) + 1e-6  # 防止除0
 
         # ====== 重新构建样本 ======
         for eval_id, df in groups:
@@ -234,6 +271,62 @@ class CosineAnnealingWarmRestarts(_LRScheduler):
                 for base_lr in self.base_lrs]
 
 
+class EarlyStopping:
+    """Simple EarlyStopping helper.
+
+    Args:
+        patience: epochs to wait after last improvement
+        min_delta: minimum change to qualify as improvement
+        mode: 'min' to monitor loss, 'max' to monitor accuracy/metric
+        restore_best: whether to restore best model state when stopping
+    """
+    def __init__(self, patience=10, min_delta=0.0, mode='min', restore_best=True, ckpt_path=None):
+        self.patience = int(patience)
+        self.min_delta = float(min_delta)
+        self.mode = mode
+        self.restore_best = restore_best
+        self.ckpt_path = ckpt_path
+
+        if mode not in ('min', 'max'):
+            raise ValueError("mode must be 'min' or 'max'")
+
+        self.best = None
+        self.num_bad_epochs = 0
+        self.is_better = (lambda a, b: a < b - self.min_delta) if mode == 'min' else (lambda a, b: a > b + self.min_delta)
+
+    def step(self, metric, model=None, optimizer=None, epoch=None):
+        """Return True when should stop."""
+        stop = False
+        if self.best is None:
+            self.best = metric
+            self.num_bad_epochs = 0
+            if self.ckpt_path and model is not None:
+                torch.save({'model_state_dict': model.state_dict(), 'epoch': epoch}, self.ckpt_path)
+            return False
+
+        if self.is_better(metric, self.best):
+            self.best = metric
+            self.num_bad_epochs = 0
+            if self.ckpt_path and model is not None:
+                torch.save({'model_state_dict': model.state_dict(), 'epoch': epoch}, self.ckpt_path)
+        else:
+            self.num_bad_epochs += 1
+
+        if self.num_bad_epochs >= self.patience:
+            stop = True
+
+        return stop
+
+    def restore_checkpoint(self, model, device=None):
+        if not self.ckpt_path:
+            return
+        if not os.path.exists(self.ckpt_path):
+            return
+        map_loc = (device if device is not None else None)
+        ck = torch.load(self.ckpt_path, map_location=map_loc)
+        model.load_state_dict(ck['model_state_dict'])
+
+
 class LSTMClassifier(nn.Module):
     def __init__(
         self,       
@@ -269,7 +362,7 @@ class LSTMClassifier(nn.Module):
         self.attn = nn.MultiheadAttention(
             embed_dim=hidden_size * self.num_directions,
             num_heads=4,
-            dropout=0.1,
+            dropout=0.3,
             batch_first=True
         )
 
@@ -289,69 +382,43 @@ class LSTMClassifier(nn.Module):
             nn.Linear(hidden_size, num_classes)
         )
 
+    def forward_static_only(self, static_feats):
+        """
+        仅用静态特征进行推理（用于 SHAP）
+        """
+        # 1. 静态特征 MLP
+        static_out = self.fc_static(static_feats)   # [N, 64]
+        # 2. Dummy 序列向量（全部为零），保持原维度一致
+        dummy_seq = torch.zeros(static_feats.size(0), 128, device=static_feats.device)  # [N, 128]
+        # 3. 拼接 (静态64 + 序列128 = 192)
+        fused = torch.cat([static_out, dummy_seq], dim=1)
+        # 4. 全连接层（模型原始的分类头）
+        logits = self.fc(fused)
 
-        # Final classifier
-        # self.fc = nn.Linear(hidden_size * self.num_directions, num_classes)
-        # self.fc = nn.Sequential(
-        #     nn.Linear(hidden_size * self.num_directions, hidden_size // 2),
-        #     nn.ReLU(),
-        #     nn.Dropout(dropout),
-        #     nn.Linear(hidden_size // 2, num_classes)
-        # )
-
-
-    # def forward(self, x: torch.Tensor, lengths: torch.Tensor, static_feat):
-    #     # Pack padded sequence
-    #     packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-    #     packed_out, _ = self.lstm(packed)
-    #     lstm_out, _ = pad_packed_sequence(packed_out, batch_first=True)
-
-    #     # Attention: compute weights for each time step
-    #     attn_weights = self.attn(lstm_out).squeeze(-1)  # (batch, seq_len)
-    #     # Mask attention weights to ignore padded time steps
-    #     mask = torch.arange(lstm_out.size(1), device=lengths.device)[None, :] < lengths[:, None]
-    #     attn_weights = attn_weights.masked_fill(~mask, -1e4)  # mask out padding
-    #     attn_weights = attn_weights - attn_weights.max(dim=1, keepdim=True)[0]  # 防溢出
-    #     attn_scores = torch.softmax(attn_weights, dim=1)  # (batch, seq_len)
-
-    #     # Compute context vector (weighted sum of lstm outputs)
-    #     context = torch.sum(lstm_out * attn_scores.unsqueeze(-1), dim=1)  # (batch, hidden*2)
+        return logits
         
-    #     # 静态特征编码
-    #     static_vec = self.fc_static(static_feat)
 
-    #     # 拼接
-    #     combined = torch.cat([context, static_vec], dim=-1)
-    #     logits = self.fc(combined)  # (batch, num_classes)
-    #     return logits
     def forward(self, x, lengths, static_feats):
         # x: (batch, seq, 2)
-
         # ----- 1. pack -----
         packed = nn.utils.rnn.pack_padded_sequence(
             x, lengths.cpu(), batch_first=True, enforce_sorted=False
         )
         packed_out, _ = self.lstm(packed)
-
         # ----- 2. unpack -----
         lstm_out, _ = nn.utils.rnn.pad_packed_sequence(
             packed_out, batch_first=True
         )  # (batch, seq, 2*hidden)
-
         # ----- 3. Multi-Head Attention -----
         # Q = K = V = lstm_out
         attn_out, _ = self.attn(lstm_out, lstm_out, lstm_out)
         # (batch, seq, 2*hidden)
-
         # ----- 4. 序列池化（取平均 or 最大）-----
         seq_repr = attn_out.mean(dim=1)  # (batch, 2*hidden)
-
         # ----- 5. 静态特征 MLP -----
         static_vec = self.fc_static(static_feats)  # (batch, 32)
-
         # ----- 6. 融合 -----
         fused = torch.cat([seq_repr, static_vec], dim=1)
-
         # ----- 7. 分类 -----
         logits = self.fc(fused)
 
@@ -386,6 +453,7 @@ def train_epoch(model, loader, criterion, optimizer, device):
 
 
 @torch.no_grad()
+
 
 def eval_epoch(model, loader, criterion, device):
     model.eval()
@@ -438,7 +506,7 @@ def find_best_threshold(probs, y_true, metric="f1"):  # metric: 'f1' 以正类F1
     return float(thr[best_idx]), float(f1s[best_idx])
 
 
-def main():  # noqa: D401
+def main():  
     # ------------------------------ Paths & Hyper‑parameters -----------------------------
     data_dir = Path("LSTM")
     id_path = r"D:/Code/DeepTTE/data/iddiag.csv"    # 身份id"video",age,sex,,edu_year,habit,label
@@ -465,10 +533,16 @@ def main():  # noqa: D401
     #     'jerk_std', 'max_pause_duration', 'pause_time_ratio', 'evaluation_id',
     # ]
 
-    x = df.drop(columns=['video','id','birthdate','game_code','save_time','create_time','update_time','touchDuration','numberInterval','name','Unnamed: 2'])  # 删除诊断标签和ID列，只保留特征
-    
+    x = df.drop(columns=['video','hkbcscore','moca_s','moca_score','diagnose','id','birthdate','game_code','save_time','create_time','update_time','touchDuration','numberInterval','name','Unnamed: 2'])  # 删除无关列
+    print("初始特征",x.columns.tolist())
+    # Ensure we do NOT leak labels in the static features
+    label_cols = [c for c in ['diagnose', 'diagnose_encoded', 'label'] if c in x.columns]
+    if len(label_cols) > 0:
+        print(f"[Warning] Dropping label columns from static features: {label_cols}")
+        x = x.drop(columns=label_cols)
+
     feature_names = x.columns.tolist()
-    # print("初始特征列表：", feature_names)
+    print("初始特征列表：", feature_names)
     # for feature_name in feature_names:
         # assert feature_name in x.columns, f"{feature_name} 不在特征列表中!"
     X = x#.drop(columns=['Unnamed: 0']).copy()
@@ -478,10 +552,9 @@ def main():  # noqa: D401
 
     batch_size = 32
     hidden_size = 64
-    static_dim = 68  # 属性特征维度
-    num_epochs = 30
+    num_epochs = 200
     learning_rate = 3e-4
-    dropout = 0.3
+    dropout = 0.4
     input_size = 9  # 2（ex, ey）
     num_layers = 3 #LSTM 层数
 
@@ -536,9 +609,12 @@ def main():  # noqa: D401
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = len(dataset.label_encoder.classes_)
     torch.backends.cudnn.enabled = False
+    # infer static feature dimension from dataset (prevents mismatch / leakage)
+    inferred_static_dim = int(dataset.static_features_scaled.shape[1])
+    print(f"[Info] Inferred static feature dim: {inferred_static_dim}")
     model = LSTMClassifier(
         input_size = input_size,
-        static_dim = static_dim,
+        static_dim = inferred_static_dim,
         hidden_size = hidden_size,
         num_layers = num_layers,
         num_classes = num_classes,
@@ -603,7 +679,22 @@ def main():  # noqa: D401
                 "label_classes": dataset.label_encoder.classes_.tolist(),
             }, ckpt_path)
             print(f"[Checkpoint] Saved improved model to {ckpt_path}")
-    epochs = range(1, num_epochs + 1)
+        
+        # --- Early stopping check ---
+        # Create early_stopper on first epoch
+        if epoch == 1:
+            early_stop_ckpt = ckpt_dir / "best_model_earlystop.pt"
+            early_stopper = EarlyStopping(patience=10, min_delta=1e-4, mode='min', restore_best=True, ckpt_path=str(early_stop_ckpt))
+
+        # monitor validation loss (mode='min')
+        should_stop = early_stopper.step(val_loss, model=model, optimizer=optimizer, epoch=epoch)
+        if should_stop:
+            print(f"[EarlyStopping] no improvement for {early_stopper.patience} epochs. Stopping at epoch {epoch}.")
+            if early_stopper.restore_best:
+                print("[EarlyStopping] Restoring best model from checkpoint.")
+                early_stopper.restore_checkpoint(model, device=device)
+            break
+    epochs = range(1, epoch + 1)
 
     # _, _, _, _, auc, _, val_probs, val_targets = eval_epoch(model, val_loader, criterion, device)
     print("\n===== Running final test evaluation =====")
@@ -644,10 +735,10 @@ def main():  # noqa: D401
     del model
     del optimizer
     del train_loader
+    del test_loader
     del val_loader
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-    
 
 
 if __name__ == "__main__":

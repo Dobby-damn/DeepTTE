@@ -120,11 +120,10 @@ class Net(nn.Module):
                  num_fc_layers=2):
         super(Net, self).__init__()
 
-        # 属性模块（你已修改过的 Attr.Net）
-        #self.attr_net = base.Attr.Net(input_dim=attr_input_dim)  #input_dim=attr_input_dim
+        # 属性模块（Attr.Net）
         self.attr_net = base.Attr.Net()
 
-        # 时空特征模块（你已修改过的 SpatioTemporal.Net）    def __init__(self, attr_size, kernel_size=5, num_filter=64, pooling='mean', rnn_type='lstm'):
+        # 时空特征模块（你已修改过的 SpatioTemporal.Net）
         self.spatio_temporal = base.SpatioTemporal.SpatioTemporalNet(
             attr_size=self.attr_net.out_size(),
             kernel_size=kernel_size,
@@ -132,9 +131,12 @@ class Net(nn.Module):
             pooling=pooling_method
         )
 
-        # 分类器头（替代 EntireEstimator）
+        # 分类器头
         fc_layers = []
         input_dim = self.spatio_temporal.out_size() + self.attr_net.out_size()
+        # print("AttrNet out:", self.attr_net.out_size())
+        # print("SpatioTemporal out:", self.spatio_temporal.out_size())
+
 
         fc_layers.append(nn.Linear(input_dim, hidden_size))
         fc_layers.append(nn.ReLU())
@@ -161,8 +163,9 @@ class Net(nn.Module):
         attr_vec = self.attr_net(attr)  # (B, D1)
 
         # 提取时空轨迹特征
-        _, _, sptm_vec = self.spatio_temporal(traj, attr_vec, config)  # (B, D2)
-
+        sptm_vec = self.spatio_temporal(traj, attr_vec, config)  # (B, D2)
+        # print("attr_vec:", attr_vec.shape)
+        # print("sptm_vec:", sptm_vec.shape)
         # 拼接全局特征
         fused = torch.cat([attr_vec, sptm_vec], dim=1)  # (B, D1 + D2)
 

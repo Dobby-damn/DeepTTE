@@ -10,7 +10,7 @@ class SpatioTemporalNet(nn.Module):
     def __init__(self, attr_size, kernel_size=5, num_filter=64, pooling='mean', rnn_type='lstm'):
         super(SpatioTemporalNet, self).__init__()
 
-        # 引入你自己修改的 PathNet（处理 ex, ey 序列）
+        # 引入你自己修改的 GeoCovNet（处理 ex, ey 序列）
         self.path_net = GeoConv.Net(kernel_size=kernel_size, num_filter=num_filter)
 
         input_size = num_filter + attr_size  # 不再拼接 +1 (dist_gap)，因为你数据中没有
@@ -26,7 +26,7 @@ class SpatioTemporalNet(nn.Module):
             self.att_fc = nn.Linear(attr_size, hidden_size)
 
     def out_size(self):
-        return 128  # 输出特征维度
+        return 96  # 输出特征维度
 
     def mean_pooling(self, hiddens, lens):
         # hiddens: (B, T, H)

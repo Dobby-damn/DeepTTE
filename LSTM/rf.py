@@ -27,8 +27,9 @@ import pandas as pd
 import math
 import torch
 from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import f1_score, roc_auc_score, precision_recall_curve
+from sklearn.metrics import f1_score, roc_auc_score, precision_recall_curve, accuracy_score, classification_report
 from sklearn.preprocessing import StandardScaler
 from torch import nn
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, pad_sequence
@@ -41,6 +42,7 @@ from data_get import TrajectoryFeatureExtractor
 
 # print("GPU是否可用：", torch.cuda.is_available())
 # print("当前GPU名称：", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "无GPU")
+
 
 class ShapWrapper(nn.Module):
     def __init__(self, model):
@@ -270,188 +272,122 @@ class CosineAnnealingWarmRestarts(_LRScheduler):
                 for base_lr in self.base_lrs]
 
 
-class CNNClassifier(nn.Module):
-    def __init__(
-        self,
-        input_size: int = 9,      # 轨迹点特征维度 (ex, ey, ...)
-        static_dim: int = 67,     # 静态属性维度
-        num_classes: int = 2,     # 分类数量
-        cnn_channels: list = [64, 128, 256], # CNN每一层的通道数
-        kernel_size: int = 3,     # 卷积核大小
-        dropout: float = 0.3
-    ) -> None:
-        super().__init__()
-        
-        # --- 1. 时序 CNN 分支 ---
-        # 构建多层 1D 卷积
-        layers = []
-        in_channels = input_size
-        
-        for out_channels in cnn_channels:
-            layers.append(nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=kernel_size//2))
-            layers.append(nn.BatchNorm1d(out_channels))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout))
-            in_channels = out_channels
-            
-        self.cnn_extractor = nn.Sequential(*layers)
-        
-        # 全局池化层：将任意长度的序列 (Batch, Channels, Seq) -> (Batch, Channels, 1)
-        # 这里使用 MaxPool，通常对捕捉轨迹中的"显著异常"或"关键转折"较好
-        self.global_pool = nn.AdaptiveMaxPool1d(1)
-        
-        cnn_out_dim = cnn_channels[-1] # 最后一层卷积的通道数，例如 256
-
-        # --- 2. 静态特征 MLP 分支 (保持与LSTM一致) ---
-        static_hidden_dim = 128
-        self.fc_static = nn.Sequential(
-            nn.Linear(static_dim, static_hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.5)
+class TrajectoryRFClassifier:
+    def __init__(self, n_estimators=100, max_depth=None, random_state=42):
+        """
+        包装 sklearn 的 RandomForest，使其适配 PyTorch DataLoader 的输入格式
+        """
+        self.clf = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1,  # 并行计算
+            class_weight='balanced' # 处理样本不平衡
         )
 
-        # --- 3. 融合与分类层 ---
-        # 拼接维度 = CNN输出维度 + 静态特征维度
-        combined_dim = cnn_out_dim + static_hidden_dim
-        
-        self.fc = nn.Sequential(
-            nn.Linear(combined_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
-        )
-
-    def forward(self, x, lengths, static_feats):
+    def extract_features(self, x, lengths, static_feats):
         """
-        参数与 LSTMClassifier 保持完全一致，方便替换
-        x: (batch, seq, input_size)
-        lengths: (batch) - CNN通常不需要lengths，因为有Padding和Pooling，但为了接口兼容保留
-        static_feats: (batch, static_dim)
+        将时序数据转换为统计特征向量
+        Input:
+            x: (Batch, Seq_Len, 9) - Tensor or Numpy
+            lengths: (Batch,)
+            static_feats: (Batch, 67)
+        Output:
+            features: (Batch, Total_Dim) - Numpy Array
         """
+        # 确保转为 numpy
+        if isinstance(x, torch.Tensor):
+            x = x.cpu().numpy()
+        if isinstance(lengths, torch.Tensor):
+            lengths = lengths.cpu().numpy()
+        if isinstance(static_feats, torch.Tensor):
+            static_feats = static_feats.cpu().numpy()
+
+        batch_size = x.shape[0]
+        num_channels = x.shape[2] # 9个特征通道 (ex, ey, vel, ...)
         
-        # ----- 1. 时序特征提取 (CNN) -----
-        # 变换维度：(Batch, Seq, Input) -> (Batch, Input, Seq)
-        # PyTorch Conv1d 要求 Channel 在第1维
-        x_permuted = x.permute(0, 2, 1) 
-        
-        # 卷积提取特征
-        feat_map = self.cnn_extractor(x_permuted) # -> (Batch, 256, Seq)
-        
-        # 全局池化 (处理变长序列的关键)
-        # 无论 Seq 是多少，输出都是 (Batch, 256, 1)
-        seq_repr = self.global_pool(feat_map)
-        
-        # 展平: (Batch, 256)
-        seq_repr = seq_repr.squeeze(-1)
+        traj_features_list = []
 
-        # ----- 2. 静态特征提取 -----
-        static_vec = self.fc_static(static_feats) # -> (Batch, 128)
+        for i in range(batch_size):
+            # 1. 截取有效序列 (去除 Padding)
+            # 这一点非常关键！不能把填充的0算进平均值里
+            seq_len = lengths[i]
+            valid_seq = x[i, :seq_len, :] # shape: (Real_Len, 9)
 
-        # ----- 3. 融合 -----
-        fused = torch.cat([seq_repr, static_vec], dim=1) # -> (Batch, 384)
+            if seq_len == 0:
+                # 极其罕见的情况，给全0
+                stats = np.zeros(num_channels * 5)
+            else:
+                # 2. 计算统计特征 (针对每个通道计算)
+                # 包括: 均值, 标准差, 最大值, 最小值, 最后一个时间点的值(终点状态)
+                feat_mean = np.mean(valid_seq, axis=0) # (9,)
+                feat_std  = np.std(valid_seq, axis=0)  # (9,)
+                feat_max  = np.max(valid_seq, axis=0)  # (9,)
+                feat_min  = np.min(valid_seq, axis=0)  # (9,)
+                # 某些诊断可能看重最后一个点的状态（比如是否最后停顿了）
+                feat_last = valid_seq[-1, :]           # (9,)
 
-        # ----- 4. 分类 -----
-        logits = self.fc(fused)
-
-        return logits
-
-    def forward_static_only(self, static_feats):
-        """
-        仅用静态特征进行推理（用于 SHAP 归因分析等）
-        """
-        # 1. 静态特征 MLP
-        static_out = self.fc_static(static_feats)   # [N, 128]
-        
-        # 2. Dummy 序列向量（全部为零）
-        # 需要与 CNN 输出维度一致 (例如 256)
-        cnn_out_dim = self.cnn_extractor[-4].out_channels # 获取最后一层卷积的通道数
-        dummy_seq = torch.zeros(static_feats.size(0), cnn_out_dim, device=static_feats.device)
-        
-        # 3. 拼接
-        fused = torch.cat([dummy_seq, static_out], dim=1)
-        
-        # 4. 全连接层
-        logits = self.fc(fused)
-
-        return logits
-
-
-def train_epoch(model, loader, criterion, optimizer, device):
-    model.train()
-    epoch_loss = correct = total = 0
-    for x, lengths, static_feats, y in loader:
-        x, lengths, static_feats, y = (
-            x.to(device), 
-            lengths.to(device),
-            static_feats.to(device), 
-            y.to(device)
-        )
-        optimizer.zero_grad()
-        logits = model(x, lengths, static_feats)  # 注意这里传入了静态特征
-        loss = criterion(logits, y)
-        loss.backward()
-        # 梯度裁剪，防止梯度爆炸
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        optimizer.step()
-
-        epoch_loss += loss.item() * y.size(0)
-        preds = logits.argmax(dim=1)
-        correct += (preds == y).sum().item()
-        total += y.size(0)
-    return epoch_loss / total, correct / total
-
-
-@torch.no_grad()
-
-def eval_epoch(model, loader, criterion, device):
-    model.eval()
-    all_probs = []
-    epoch_loss = correct = total = 0
-    all_preds = []
-    all_targets = []
-    
-    with torch.no_grad():
-        for x, lengths, static_feats, y in loader:
-            x, lengths, static_feats, y = (
-                x.to(device), 
-                lengths.to(device), 
-                static_feats.to(device),
-                y.to(device)
-            )
-
-            logits = model(x, lengths, static_feats)
-            loss = criterion(logits, y)
-
-            probs = torch.softmax(logits, dim=1)[:, 1]
+                # 拼接该样本的所有时序统计特征 -> 9 * 5 = 45 维
+                stats = np.concatenate([feat_mean, feat_std, feat_max, feat_min, feat_last])
             
-            epoch_loss += loss.item() * y.size(0)
-            preds = logits.argmax(dim=1)
-            correct += (preds == y).sum().item()
-            total += y.size(0)
+            traj_features_list.append(stats)
+
+        # (Batch, 45)
+        traj_features = np.array(traj_features_list)
+        
+        # 3. 与静态特征拼接
+        # 最终维度: 45 (轨迹统计) + 67 (静态) = 112 维
+        combined_features = np.concatenate([traj_features, static_feats], axis=1)
+        
+        return combined_features
+
+    def prepare_data_from_loader(self, dataloader):
+        """
+        遍历整个 DataLoader，收集所有数据并转换为 RF 可用的 Numpy 矩阵
+        """
+        all_feats = []
+        all_labels = []
+
+        print("Extracting features for Random Forest...")
+        for batch in tqdm(dataloader):
+            # 解包你的 DataLoader (假设顺序是 x, lengths, static, label)
+            x, lengths, static_feats, labels = batch
             
-            # 收集所有预测和标签
-            all_probs.extend(probs.cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
-            all_targets.extend(y.cpu().numpy())
-    
-    # 计算各项指标
-    avg_loss = epoch_loss / total
-    accuracy = correct / total
-    #f1 = f1_score(all_targets, all_preds, average='binary')  # 默认计算类别1的F1
-    macro_f1 = f1_score(all_targets, all_preds, average="macro")
-    f1_class1 = f1_score(all_targets, all_preds, pos_label=1)
-    f1_class0 = f1_score(all_targets, all_preds, pos_label=0)  # 专门计算类别0的F1
-    auc = roc_auc_score(all_targets, all_probs)
-    return  avg_loss, accuracy, f1_class1, f1_class0, auc, macro_f1, all_probs, all_targets # 正常类（类别0）的F1
+            # 提取特征
+            feats = self.extract_features(x, lengths, static_feats)
+            
+            all_feats.append(feats)
+            all_labels.append(labels.cpu().numpy())
 
+        # 堆叠成大矩阵
+        X_full = np.vstack(all_feats) # (Total_Samples, 112)
+        y_full = np.concatenate(all_labels) # (Total_Samples,)
+        
+        return X_full, y_full
 
-def find_best_threshold(probs, y_true, metric="f1"):  # metric: 'f1' 以正类F1最大为准
-    prec, rec, thr = precision_recall_curve(y_true, probs)
-    f1s = 2 * prec * rec / (prec + rec + 1e-12)
-    if len(thr) == 0:
-        return 0.5, 0.0
-    best_idx = np.argmax(f1s[:-1])  # 跳过最后一个点
-    return float(thr[best_idx]), float(f1s[best_idx])
+    def fit(self, train_loader):
+        X_train, y_train = self.prepare_data_from_loader(train_loader)
+        print(f"Start Training Random Forest with input shape: {X_train.shape}")
+        self.clf.fit(X_train, y_train)
+        print("RF Training Done.")
+
+    def evaluate(self, test_loader):
+        X_test, y_test = self.prepare_data_from_loader(test_loader)
+        
+        # 预测
+        y_pred = self.clf.predict(X_test)
+        
+        # 评估
+        acc = accuracy_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred, average='weighted')
+        
+        print("\n=== Random Forest Results ===")
+        print(f"Accuracy: {acc:.4f}")
+        print(f"F1 Score: {f1:.4f}")
+        print("Classification Report:")
+        print(classification_report(y_test, y_pred))
+        
+        return acc
 
 
 def main():  
@@ -466,8 +402,20 @@ def main():
     iddiag_path_new = r"D:/Code/DeepTTE/data/连线测试体检.csv"      # 其他的一些特征
     traj_path_new = r"D:/Code/DeepTTE/data/连线测试轨迹体检.csv"    # 轨迹特征
 
+    # # 获取属性特征，edu_year, sex, age ,mean_speed etlc.    我的目标：将所有的特征整合为一个打的dataframe变量。（储存到csv中？）
+    # extractor = TrajectoryFeatureExtractor(id_path, iddiag_path, traj_csv_path, traj_xlsx_path, id_path_new, iddiag_path_new, traj_path_new)
+    # X, y = extractor.get_feature_matrix_and_target() #这里返回的是DataFrame格式
+
     # print(X.head())
     df = pd.read_parquet('data.parquet')
+    # features = [
+    #     'age', 'edu_year',  # 人口统计'edu_year','sex'
+    #     'mean_speed', 'std_speed', 'total_distance',  # 轨迹特征
+    #     'total_time', 'pause_count', 'speed_variation', 'point_count',
+    #     'mean_curvature', 'max_curvature', 'curvature_std', 'high_curvature_points',  # 曲率特征
+    #     'complexity_ratio', 'direction_changes', 'mean_acceleration',
+    #     'jerk_std', 'max_pause_duration', 'pause_time_ratio', 'evaluation_id',
+    # ]
 
     x = df.drop(columns=['video','hkbcscore','moca_s','moca_score','diagnose','id','birthdate','game_code','save_time','create_time','update_time','touchDuration','numberInterval','name','Unnamed: 2'])  # 删除无关列
     print("初始特征",x.columns.tolist())
@@ -479,23 +427,20 @@ def main():
 
     feature_names = x.columns.tolist()
     print("初始特征列表：", feature_names)
-
+    # for feature_name in feature_names:
+        # assert feature_name in x.columns, f"{feature_name} 不在特征列表中!"
     X = x#.drop(columns=['Unnamed: 0']).copy()
+        # print(X.columns.tolist())
+        
+
 
     batch_size = 32
-    hidden_size = 64
-    num_epochs = 200
-    learning_rate = 3e-4
-    dropout = 0.4
-    input_size = 9  # 2（ex, ey）
-    num_layers = 3 #LSTM 层数
 
     # ----------------------------------- Dataset ---------------------------------------
     dataset = TrajectoryDataset('data.parquet', traj_csv_path, traj_xlsx_path, traj_path_new, X)
     
     labels = [lbl for *_, lbl in dataset.samples]
-
-    # 0.6/0.2/0.2 划分训练/验证/测试集
+    # 0.7/0.15/0.15 划分训练/验证/测试集
     train_idx, temp_idx = train_test_split(
         np.arange(len(dataset)),
         test_size=0.3,
@@ -514,6 +459,8 @@ def main():
     train_loader = DataLoader(
         dataset,
         batch_sampler = train_sampler,
+        # batch_size = batch_size,
+        # shuffle = True,
         collate_fn = collate_fn,
     )
     val_loader = DataLoader(
@@ -529,127 +476,21 @@ def main():
         collate_fn=collate_fn,
     )
     
-    # ---------------------------------- Model & Optim ----------------------------------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_classes = len(dataset.label_encoder.classes_)
-    torch.backends.cudnn.enabled = False
-    # infer static feature dimension from dataset (prevents mismatch / leakage)
-    inferred_static_dim = int(dataset.static_features_scaled.shape[1])
-    print(f"[Info] Inferred static feature dim: {inferred_static_dim}")
-    # model = LSTMClassifier(
-    #     input_size = input_size,
-    #     static_dim = inferred_static_dim,
-    #     hidden_size = hidden_size,
-    #     num_layers = num_layers,
-    #     num_classes = num_classes,
-    #     dropout = dropout,
-    # ).to(device)
-    model = CNNClassifier(
-        input_size=input_size, 
-        static_dim=inferred_static_dim, 
-        cnn_channels=[64, 128, 256], # 可选：控制网络深度和宽度
-        dropout=dropout
-    ) .to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)  # 初始学习率 L2正则化
+    # 1. 初始化模型
+    rf_model = TrajectoryRFClassifier(n_estimators=200, max_depth=20)
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=10,
-        min_lr=1e-6
-    )
-        
+    # 2. 训练
+    # 注意：RF 是一次性训练，不需要 epoch 循环
+    rf_model.fit(train_loader)
 
-    #  为 CrossEntropyLoss 添加类别权重，这能显著抑制模型倾向于预测“异常”，从而提高对“正常”的识别率。
-    class_counts = np.bincount(labels)  # [236, 447]
-    weights = 1.0 / torch.tensor(class_counts, dtype=torch.float32)
-    weights = weights / weights.sum()  # 归一化为 1
-    criterion = nn.CrossEntropyLoss(weight=weights.to(device))
-
-    # ------------------------------- Training Loop -------------------------------------
-    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
-    best_val_acc = 0.0
-    ckpt_dir = Path("checkpoints")
-    ckpt_dir.mkdir(exist_ok=True)
-
-    for epoch in range(1, num_epochs + 1):
-        
-        tr_loss, tr_acc = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc, f1, f1_class0, auc, *_ = eval_epoch(model, val_loader, criterion, device)
-
-        history["train_loss"].append(tr_loss)
-        history["val_loss"].append(val_loss)
-        history["train_acc"].append(tr_acc)
-        history["val_acc"].append(val_acc)
-        history.setdefault("f1_score", []).append(f1)
-        history.setdefault("f1_score_class0", []).append(f1_class0)
-
-        scheduler.step(val_loss)  # 每个epoch更新学习率
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch}, LR: {current_lr:.6f}")
-
-        print(
-            f"Epoch {epoch:02d}/{num_epochs} | "
-            f"train_loss={tr_loss:.4f}, train_acc={tr_acc:.4f} | "
-            f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}"
-        )
-
-        # Incremental save when validation improves
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            ckpt_path = ckpt_dir / f"best_model_epoch{epoch}.pt"
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "epoch": epoch,
-                "val_acc": val_acc,
-                "label_classes": dataset.label_encoder.classes_.tolist(),
-            }, ckpt_path)
-            print(f"[Checkpoint] Saved improved model to {ckpt_path}")
-    epochs = range(1, num_epochs + 1)
-
-    # _, _, _, _, auc, _, val_probs, val_targets = eval_epoch(model, val_loader, criterion, device)
-    print("\n===== Running final test evaluation =====")
-    test_loss, test_acc, test_f1, test_f1_class0, test_auc, _, val_probs, val_targets = eval_epoch(model, test_loader, criterion, device)
-    best_thr, best_f1 = find_best_threshold(val_probs, val_targets, metric="f1")
-    print(f"Best F1(1)={best_f1:.3f} at threshold={best_thr:.3f}")
-    print(f"[TEST] loss={test_loss:.4f}, acc={test_acc:.4f}, "f"f1={test_f1:.4f}, auc={test_auc:.4f}")
-
-    plt.figure()
-    plt.plot(epochs, history["train_loss"], label="Training loss")
-    plt.plot(epochs, history["val_loss"], label="Validation loss")
-
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("loss_curve.png")
-
-    plt.figure()
-    plt.plot(epochs, history["train_acc"], label="Training acc")
-    plt.plot(epochs, history["val_acc"], label="Validation acc")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("accuracy_curve.png")
-
-    plt.figure()
-    plt.plot(epochs, history["f1_score"], label="F1 score")
-    plt.plot(epochs, history["f1_score_class0"], label="F1 score normal")
-    plt.xlabel(f"[TEST] loss={test_loss:.4f}, acc={test_acc:.4f}, "f"f1={test_f1:.4f}, auc={test_auc:.4f}")
-    plt.ylabel("f1 score")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("f1_score_curve.png")
-
-    print("Training finished. Curves saved as loss_curve.png & accuracy_curve.png")
-    del model
-    del optimizer
+    # 3. 测试
+    rf_model.evaluate(test_loader)
     del train_loader
+    del test_loader
     del val_loader
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
+
 
 if __name__ == "__main__":
     main()

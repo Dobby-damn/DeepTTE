@@ -19,7 +19,7 @@ class Net(nn.Module):
     """
 
     # 原始 driverID 最大值 (你需要确认实际范围)
-    embed_dims = [('driverID', 60000, 16)]  # 可根据实际被试数量修改，最多6W个被试，16维embedding
+    embed_dims = [('driverID', 9999999, 16)]  # 可根据实际被试数量修改，最多6W个被试，16维embedding
 
     def __init__(self):
         super(Net, self).__init__()
@@ -73,7 +73,7 @@ class Net(nn.Module):
         ], dim=1)
 
         # 可选归一化
-        cont = utils.normalize(cont, 'attr_cont') if hasattr(utils, 'normalize') else cont
+        # cont = utils.normalize(cont, 'attr_cont') if hasattr(utils, 'normalize') else cont
 
         cont_emb = F.relu(self.cont_fc(cont))
         em_list.append(cont_emb)

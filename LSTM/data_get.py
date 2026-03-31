@@ -24,6 +24,7 @@ class TrajectoryFeatureExtractor:
         print(f"被试基本信息数据量: {len(self.df_demo)}条记录") #780条记录
         self.df_traj = self._load_and_merge_trajectory_data()
         print(f"轨迹数据量: {len(self.df_traj)}条记录")   #1462741条记录
+        
 
 
     def _load_demo_data(self):
@@ -31,13 +32,15 @@ class TrajectoryFeatureExtractor:
         # 先重置索引，防止evaluation_id作为索引
         df1 = pd.read_csv(self.id_path)   #身份id"video",age,sex,,edu_year,habit,label   685条记录
         df2 = pd.read_csv(self.iddiag_path)  #evaluation_id,其他的一些特征。 641条记录
+        df2.drop('eduYears', axis=1, inplace=True)
+        df2["evaluation_id"] = df2["evaluation_id"].astype(float)
         if 'video' in df1.index.names:
             df1 = df1.reset_index(drop=True)  # 重设索引
 
         print("\n正在合并数据集...")
 
         df = pd.merge(df1, df2, left_on='video', right_on='evaluation_id')   # 合并后586条记录
-        
+        df.drop('video', axis=1, inplace=True)
         df = df.drop(columns='age_y').rename(columns={'age_x': 'age'})
         print(df.head(5))
 
@@ -49,10 +52,12 @@ class TrajectoryFeatureExtractor:
 
 
         df4 = pd.read_csv(self.iddiag_path_new)  #evaluation_id,其他的一些特征。284条
-        df_new = pd.merge(df3, df4, left_on='cmbctid', right_on='evaluation_id')
+        df_new = pd.merge(df3, df4, left_on='evaluation_id', right_on='evaluation_id')
         df_new = df_new.drop(columns='age_y').rename(columns={'age_x': 'age'})
-        df = pd.concat([df, df_new], axis=0, ignore_index=True)
-        return df
+        df_new = df_new.rename(columns={'moca_s': 'moca_score'})
+        df_new = df_new.rename(columns={'eduYears': 'edu_year'})
+        dataframe = pd.concat([df, df_new], axis=0, ignore_index=True)
+        return dataframe
 
     def _process_time_column(self, df):
         """处理时间列，统一两种时间格式"""
@@ -130,7 +135,6 @@ class TrajectoryFeatureExtractor:
             df_traj3 = df_traj3.drop('create_time', axis=1) 
             df_traj3 = self._process_time_column(df_traj3)
             df_traj3['timestamp'] = df_traj3['time'].astype('int64') / 1e9
-            # 合并新轨迹数据
         else:
             raise FileNotFoundError(f"未找到文件: {self.traj_xlsx_path}")
         
@@ -218,7 +222,8 @@ class TrajectoryFeatureExtractor:
 
     def _extract_features(self):
         """从轨迹数据计算特征"""
-        traj_features = self.df_traj.groupby('evaluation_id').apply(self._calculate_trajectory_features)
+        temp = self._calculate_trajectory_features
+        traj_features = self.df_traj.groupby('evaluation_id').apply(temp)
         traj_features = traj_features.reset_index()
         return traj_features
 
@@ -228,10 +233,18 @@ class TrajectoryFeatureExtractor:
         # 提取轨迹特征,以及计算运动学特征
         traj_features = self._extract_features()   #（790.20）
 
+        # 将每个 evaluation_id 的 ex, ey 按时间顺序聚合为列表，便于保存原始轨迹点
+        traj_coords = self.df_traj.groupby('evaluation_id', sort=False).agg({
+            'ex': lambda s: s.tolist(),
+            'ey': lambda s: s.tolist()
+        }).reset_index()
+
         # 重设索引，防止冲突
         if 'evaluation_id' in traj_features.index.names:
             traj_features = traj_features.reset_index(drop=True)
         df_temp = pd.merge(self.df_demo, traj_features, left_on='evaluation_id', right_on='evaluation_id')  #shape:697.80
+        # 将原始轨迹点序列合并到临时表，列名为 ex_seq, ey_seq（每行是列表）
+        df_temp = pd.merge(df_temp, traj_coords, on='evaluation_id', how='left')
         # print(df.head())
 
         # 定义目标变量
@@ -240,8 +253,8 @@ class TrajectoryFeatureExtractor:
         # 处理point_count列
         df_temp['point_count'] = pd.to_numeric(df_temp['point_count'], errors='coerce').fillna(0).astype('int64')
         df = df_temp.drop(columns=['id','birthdate','game_code','save_time','create_time','update_time','touchDuration','numberInterval','name','Unnamed: 2']) 
-        df.to_parquet('data.parquet')
-        print("已保存到 data.parquet 文件中。")
+        df.to_parquet('data1.parquet')
+        print("已保存到 data1.parquet 文件中。")
 
         
 if __name__ == "__main__":

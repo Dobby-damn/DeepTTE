@@ -1,3 +1,9 @@
+DSTLF为主文件，
+attr_keys: dict_keys(['Unnamed: 0', 'record_id', 'age', 'sex', 'hand', 'edu_year', 'edugrade', 'occupation', 'habit1', 'habit2', 'habit3', 'habit4', 'habit5', 'habit6', 'diagnose', 'ssoid', 'oppo_sub', 'evaluation_type', 'data_type', 'completed', 'correctConnections', 'incorrectConnections', 'clickCount', 'noTouchCount', 'gameDuration', 'type', 'connTime', 'show_T', 'show_D', 'ConnTime_ET1', 'ConnTime_T1', 'ConnTime_D', 'ConnTime_T', 'education', 'mmse_s', 'adl_s', 'phq_s', 'sas_s', 'ab42', 'ab40', 'ab42_40', 'pt217', 'pt217_ab42', 'Unnamed: 3', 'mean_speed', 'std_speed', 'total_distance', 'total_time', 'pause_count', 'max_speed', 'min_speed', 'speed_variation', 'point_count', 'complexity_ratio', 'direction_changes', 'mean_acceleration', 'jerk_std', 'max_pause_duration', 'pause_time_ratio', 'mean_curvature', 'max_curvature', 'curvature_std', 'high_curvature_points'])
+
+
+
+
 This project is the code of AAAI 2018 paper ***When Will You Arrive? Estimating Travel Time Based on Deep Neural Networks***.
 
 We provide the complete version of code and part of sample data in Chengdu. You can replace the sample data with your own data easily. See the samples in data/ for more details.

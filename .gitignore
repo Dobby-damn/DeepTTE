@@ -6,5 +6,6 @@
 *.pt
 #foloders
 logs/*
+*.png
 
 

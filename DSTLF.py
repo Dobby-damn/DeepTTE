@@ -35,10 +35,19 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.model_selection import StratifiedGroupKFold
+from evaluation.metrics import compute_binary_metrics
 
 #############################################dataloader部分#############################################
 class ParquetDataset(Dataset):
-    def __init__(self, file_path, normalize=True):
+    META_FIELDS = [
+        'evaluation_id', 'driverID', 'record_id', 'diagnose', 'age', 'sex', 'hand',
+        'edu_year', 'education', 'edugrade', 'occupation', 'hospital', 'center', 'site',
+        'gameDuration', 'clickCount', 'correctConnections', 'incorrectConnections',
+        'noTouchCount', 'connTime', 'total_time', 'total_distance', 'mean_speed',
+        'std_speed', 'pause_count', 'pause_time_ratio'
+    ]
+
+    def __init__(self, file_path=None, normalize=True, dataframe=None, normalizer=None, fit_normalizer=True):
         """
         Args:
             file_path: Parquet 文件路径
@@ -49,11 +58,20 @@ class ParquetDataset(Dataset):
    
         # 1. 读取 Parquet
         # engine='pyarrow' 或 'fastparquet'，通常默认即可
-        self.df = pd.read_parquet(file_path).drop(columns=[ 'moca_score'])
+        if dataframe is not None:
+            source_df = dataframe.copy()
+            source_name = "<dataframe>"
+        else:
+            source_df = pd.read_parquet(file_path)
+            source_name = file_path
+
+        # Keep raw demographics for subgroup analysis. The model-facing copy may
+        # be normalized below, so it cannot be used for clinically meaningful bins.
+        self.raw_df = source_df.copy()
+        self.df = source_df.drop(columns=['moca_score'], errors='ignore').copy()
         
-        # 打印一下读到了多少特征，方便核对
-        print(f"成功加载 Parquet 数据: {len(self.df)} 条样本")
-        print(f"包含列名: {list(self.df.columns)}")
+        print(f"Loaded dataset from {source_name}: {len(self.df)} samples")
+        print(f"Columns: {list(self.df.columns)}")
         
         # 2. 预处理
         # 确保 ex, ey 是 list 类型 (有些 parquet 存的是 string 或 numpy array)
@@ -62,45 +80,85 @@ class ParquetDataset(Dataset):
         self.exclude_cols = ['ex', 'ey', 'label', 'driverID', 'evaluation_id', 'diagnose', 
                              'sex', 'hand'] 
         self.cont_cols = [c for c in self.df.columns if c not in self.exclude_cols and pd.api.types.is_numeric_dtype(self.df[c])]
-        print(f"检测到 {len(self.cont_cols)} 个连续特征需要归一化: {self.cont_cols[:5]}...")
+        print(f"Detected {len(self.cont_cols)} continuous columns for normalization: {self.cont_cols[:5]}...")
         self.normalize = normalize
         if self.normalize:
-            self._apply_normalization()
+            self._apply_normalization(normalizer=normalizer, fit=fit_normalizer)
             
-    def _apply_normalization(self):
-        print("正在执行数据归一化 (Z-Score)...")
-        
-        # 1. 静态属性归一化 (直接在 DataFrame 上修改)
-        # 使用 sklearn 的 StandardScaler
-        scaler = StandardScaler()
-        # 处理可能的 NaN (填充 0 或 均值，这里简单填充 0)
+    def _apply_normalization(self, normalizer=None, fit=True):
+        print("Applying normalization (Z-score)...")
+
+        # Static attributes: fit on the training fold, then transform validation/test folds.
         self.df[self.cont_cols] = self.df[self.cont_cols].fillna(0)
-        
-        # fit_transform 会计算均值方差并转换数据
-        self.df[self.cont_cols] = scaler.fit_transform(self.df[self.cont_cols])
-        print("✅ 静态属性归一化完成")
+
+        if fit or normalizer is None:
+            scaler = StandardScaler()
+            if self.cont_cols:
+                self.df[self.cont_cols] = scaler.fit_transform(self.df[self.cont_cols])
+            normalizer = {"static_scaler": scaler, "cont_cols": list(self.cont_cols)}
+        else:
+            scaler = normalizer["static_scaler"]
+            expected_cols = normalizer.get("cont_cols", self.cont_cols)
+            if list(expected_cols) != list(self.cont_cols):
+                raise ValueError(f"Normalizer columns do not match dataset columns: {expected_cols} != {self.cont_cols}")
+            if self.cont_cols:
+                self.df[self.cont_cols] = scaler.transform(self.df[self.cont_cols])
+        print("Static attribute normalization complete.")
 
         # 2. 轨迹坐标归一化 (计算全局均值和标准差)
         # 注意：ex 和 ey 是列表，不能直接用 scaler。我们需要展平所有轨迹点来计算。
         # 这里为了效率，我们先随机采样一部分数据估算，或者全量计算（取决于数据量）
         
-        # 获取所有轨迹点的列表
-        all_ex = np.concatenate(self.df['ex'].values)
-        all_ey = np.concatenate(self.df['ey'].values)
-        
-        # 计算全局统计量
-        self.ex_mean = all_ex.mean()
-        self.ex_std = all_ex.std() + 1e-6 # 防止除0
-        
-        self.ey_mean = all_ey.mean()
-        self.ey_std = all_ey.std() + 1e-6
-        
-        print(f"✅ 轨迹归一化参数计算完成:")
+        if fit or normalizer is None or "ex_mean" not in normalizer:
+            # Fit coordinate normalization on the current dataframe, normally the training fold.
+            all_ex = np.concatenate(self.df['ex'].values)
+            all_ey = np.concatenate(self.df['ey'].values)
+
+            self.ex_mean = all_ex.mean()
+            self.ex_std = all_ex.std() + 1e-6
+
+            self.ey_mean = all_ey.mean()
+            self.ey_std = all_ey.std() + 1e-6
+            normalizer.update(
+                {
+                    "ex_mean": self.ex_mean,
+                    "ex_std": self.ex_std,
+                    "ey_mean": self.ey_mean,
+                    "ey_std": self.ey_std,
+                }
+            )
+            del all_ex, all_ey
+        else:
+            self.ex_mean = normalizer["ex_mean"]
+            self.ex_std = normalizer["ex_std"]
+            self.ey_mean = normalizer["ey_mean"]
+            self.ey_std = normalizer["ey_std"]
+        self.normalizer = normalizer
+
+        print("Trajectory normalization parameters ready:")
         print(f"   ex: mean={self.ex_mean:.4f}, std={self.ex_std:.4f}")
         print(f"   ey: mean={self.ey_mean:.4f}, std={self.ey_std:.4f}")
 
-        # 释放内存
-        del all_ex, all_ey
+    def get_normalizer(self):
+        return getattr(self, "normalizer", None)
+
+    def _metadata_from_row(self, row):
+        meta = {}
+        for field in self.META_FIELDS:
+            if field not in row:
+                continue
+            value = row[field]
+            try:
+                if pd.isna(value):
+                    value = None
+            except ValueError:
+                continue
+            if hasattr(value, "item"):
+                value = value.item()
+            meta[field] = value
+        if "evaluation_id" not in meta and "driverID" in meta:
+            meta["evaluation_id"] = meta["driverID"]
+        return meta
 
     def __len__(self):
         return len(self.df)
@@ -108,6 +166,7 @@ class ParquetDataset(Dataset):
     def __getitem__(self, idx):
         # 获取 DataFrame 的一行 (Series 对象)
         row = self.df.iloc[idx]
+        raw_row = self.raw_df.iloc[idx]
         
         # === 1. 构建 Attr 字典 === 
         attr_dict = {}
@@ -176,7 +235,8 @@ class ParquetDataset(Dataset):
             'attr': attr_dict,
             'traj': traj_dict,
             'label': label,
-            'driverID': driver_id 
+            'driverID': driver_id,
+            'meta': self._metadata_from_row(raw_row)
         }
 
 
@@ -233,7 +293,7 @@ def collate_fn(batch):
     #     print(k, v.shape, v.dtype)
 
     # 仅为了 debug 或 logging 保留 ID，不传入 forward
-    meta_ids = [b['driverID'] for b in batch] 
+    meta_ids = [b.get('meta', {'evaluation_id': b['driverID'], 'driverID': b['driverID']}) for b in batch]
     
     return attr, traj, labels, meta_ids
 
@@ -246,8 +306,12 @@ class BucketBatchSampler(Sampler):
 
         # 记录每个样本的长度
         self.lengths = []
-        subset_indices = self.data_source.indices
-        original_dataset = self.data_source.dataset
+        if hasattr(self.data_source, "indices") and hasattr(self.data_source, "dataset"):
+            subset_indices = self.data_source.indices
+            original_dataset = self.data_source.dataset
+        else:
+            subset_indices = range(len(self.data_source))
+            original_dataset = self.data_source
         for original_idx in subset_indices:
             # 直接访问 DataFrame 获取长度，速度最快
             row = original_dataset.df.iloc[original_idx]
@@ -282,18 +346,19 @@ class BucketBatchSampler(Sampler):
         return len(self.buckets)
 
 # 修改 get_loader 函数，确保按 ID 划分
-def get_loader(file_path, batch_size, test_ratio=0.2, val_ratio=0.2, num_workers=0, seed=8): # 加载所有数据 
-    content = ParquetDataset(file_path=file_path,  normalize=True) 
+def get_loader(file_path, batch_size, test_ratio=0.2, val_ratio=0.2, num_workers=0, seed=8): # 加载所有数据
+    content = ParquetDataset(file_path=file_path, normalize=False)
+    raw_df = content.raw_df.copy()
 
 
     # 提取所有唯一的 driverID (Subject ID) 
     # 假设数据中每个 dict 都有 'driverID' 字段 
-    all_subject_ids = content.df['evaluation_id'].unique().tolist() 
+    all_subject_ids = raw_df['evaluation_id'].unique().tolist()
     all_subject_ids.sort() # 保证顺序固定 
     id_labels =[]
     for subj_id in all_subject_ids:
         # 找到这个病人，取他的一条标签
-        label = content.df[content.df['evaluation_id'] == subj_id]['diagnose'].iloc[0]
+        label = raw_df[raw_df['evaluation_id'] == subj_id]['diagnose'].iloc[0]
         id_labels.append(label)
     # 按 Subject ID 划分 
     train_ids, test_ids = train_test_split(all_subject_ids, test_size=test_ratio, random_state=seed, stratify=id_labels) 
@@ -301,13 +366,14 @@ def get_loader(file_path, batch_size, test_ratio=0.2, val_ratio=0.2, num_workers
     train_labels = [id_labels[all_subject_ids.index(i)] for i in train_ids]
     train_ids, val_ids = train_test_split(train_ids, test_size=val_ratio/(1-test_ratio), random_state=seed, stratify=train_labels) 
     print(f"Split Info: Train IDs: {len(train_ids)}, Val IDs: {len(val_ids)}, Test IDs: {len(test_ids)}") 
-    # 根据 ID 构建数据集列表 
-    train_indices = content.df.index[content.df['evaluation_id'].isin(train_ids)].tolist() 
-    val_indices = content.df.index[content.df['evaluation_id'].isin(val_ids)].tolist() 
-    test_indices = content.df.index[content.df['evaluation_id'].isin(test_ids)].tolist() 
-    train_set = Subset(content, train_indices) 
-    val_set = Subset(content, val_indices) 
-    test_set = Subset(content, test_indices) 
+    # 根据 ID 构建数据集，并仅使用训练集拟合归一化参数。
+    train_df = raw_df[raw_df['evaluation_id'].isin(train_ids)].copy()
+    val_df = raw_df[raw_df['evaluation_id'].isin(val_ids)].copy()
+    test_df = raw_df[raw_df['evaluation_id'].isin(test_ids)].copy()
+    train_set = ParquetDataset(dataframe=train_df, normalize=True, fit_normalizer=True)
+    normalizer = train_set.get_normalizer()
+    val_set = ParquetDataset(dataframe=val_df, normalize=True, normalizer=normalizer, fit_normalizer=False)
+    test_set = ParquetDataset(dataframe=test_df, normalize=True, normalizer=normalizer, fit_normalizer=False)
     # DataLoader 
     train_sampler = BucketBatchSampler(train_set, batch_size) #按照长度分组
     train_loader = DataLoader(train_set, batch_sampler=train_sampler, collate_fn=collate_fn, num_workers=num_workers) 
@@ -335,7 +401,19 @@ class FocalLoss(nn.Module):
             return torch.sum(F_loss)
 
 
-def train(model, elogger, train_loader, val_loader, test_loader, epochs, batch_size, lr=1e-3, device=None):
+def train(
+    model,
+    elogger,
+    train_loader,
+    val_loader,
+    test_loader,
+    epochs,
+    batch_size,
+    lr=1e-3,
+    device=None,
+    checkpoint_path="best_model.pth",
+    evaluate_test=True,
+):
     """
     训练二分类 DeepTTE 模型
     """
@@ -345,6 +423,8 @@ def train(model, elogger, train_loader, val_loader, test_loader, epochs, batch_s
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     # ===== 统计训练集类别分布（只做一次）=====
     label_counter = Counter()
 
@@ -377,8 +457,7 @@ def train(model, elogger, train_loader, val_loader, test_loader, epochs, batch_s
         mode='max',        # 因为我们看的是 val_acc
         factor=0.8,        # 每次衰减为原来的 0.8
         patience=10,        # 5 个 epoch 不提升就降 LR
-        min_lr=1e-5,        # 最小学习率
-        verbose=True
+        min_lr=1e-5        # 最小学习率
     )
     best_val_acc = 0.0
 
@@ -431,7 +510,7 @@ def train(model, elogger, train_loader, val_loader, test_loader, epochs, batch_s
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             patience_counter = 0
-            torch.save(model.state_dict(), "best_model.pth")
+            torch.save(model.state_dict(), checkpoint_path)
             elogger.log(f"Saved new best model @ Epoch {epoch}")
         else:
             patience_counter += 1
@@ -443,52 +522,77 @@ def train(model, elogger, train_loader, val_loader, test_loader, epochs, batch_s
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Current LR: {current_lr:.6f}")
 
-    # ===== 测试阶段 =====
-    model.load_state_dict(torch.load("best_model.pth"))
-    test_acc, test_f1, test_auc, test_sensitivity, test_specificity = evaluate(model, test_loader, device)
-    elogger.log(f"Test Accuracy={test_acc:.4f}, Test F1={test_f1:.4f}, Test AUC={test_auc:.4f}, Test Sensitivity={test_sensitivity:.4f}, Test Specificity={test_specificity:.4f}")
-    print(f"\n Final Test Accuracy: {test_acc:.4f}, F1-score: {test_f1:.4f}, AUC: {test_auc:.4f}, Sensitivity: {test_sensitivity:.4f}, Specificity: {test_specificity:.4f}, Best Val Accuracy: {best_val_acc:.4f}")
+    if evaluate_test:
+        # ===== 测试阶段 =====
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        test_acc, test_f1, test_auc, test_sensitivity, test_specificity = evaluate(model, test_loader, device)
+        elogger.log(f"Test Accuracy={test_acc:.4f}, Test F1={test_f1:.4f}, Test AUC={test_auc:.4f}, Test Sensitivity={test_sensitivity:.4f}, Test Specificity={test_specificity:.4f}")
+        print(f"\n Final Test Accuracy: {test_acc:.4f}, F1-score: {test_f1:.4f}, AUC: {test_auc:.4f}, Sensitivity: {test_sensitivity:.4f}, Specificity: {test_specificity:.4f}, Best Val Accuracy: {best_val_acc:.4f}")
     elogger.close()
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def collect_predictions(model, loader, device):
     model.eval()
-    all_preds, all_labels, all_probs = [], [], []
+    records = []
 
-    for attr, traj, labels, driver_ids in loader:
+    for attr, traj, labels, metadata in loader:
         attr = {k: v.to(device) for k, v in attr.items()}
         traj = {k: v.to(device) for k, v in traj.items()}
-        
+
         labels = labels.to(device)
 
         logits = model(attr, traj)
         probs = torch.softmax(logits, dim=1)[:, 1]
         preds = torch.argmax(logits, dim=1)
 
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-        all_probs.extend(probs.cpu().numpy())
+        labels_cpu = labels.detach().cpu().numpy()
+        probs_cpu = probs.detach().cpu().numpy()
+        preds_cpu = preds.detach().cpu().numpy()
 
-    acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='macro')
-    try:
-        auc = roc_auc_score(all_labels, all_probs)
-    except ValueError:
-        auc = 0.5  # 防止某一折全为一个类别时报错
+        for index in range(len(labels_cpu)):
+            meta = metadata[index] if index < len(metadata) else {}
+            if isinstance(meta, dict):
+                record = dict(meta)
+            else:
+                record = {"evaluation_id": meta}
+            record.update(
+                {
+                    "y_true": int(labels_cpu[index]),
+                    "y_prob": float(probs_cpu[index]),
+                    "y_pred": int(preds_cpu[index]),
+                }
+            )
+            records.append(record)
+    return pd.DataFrame(records)
 
-    cm = confusion_matrix(all_labels, all_preds)
-    if cm.shape == (2, 2):
-        tn, fp, fn, tp = cm.ravel()
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0  # 找病人的能力
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0  # 认健康人的能力
-    else:
-        sensitivity, specificity = 0.0, 0.0
-        print("Warning: Confusion matrix is not 2x2. One class might be missing.")
+
+@torch.no_grad()
+def evaluate(model, loader, device, threshold=0.5, return_details=False):
+    predictions = collect_predictions(model, loader, device)
+    metrics = compute_binary_metrics(
+        predictions["y_true"],
+        predictions["y_prob"],
+        threshold=threshold,
+    )
+
+    acc = metrics["accuracy"]
+    f1 = metrics["f1_macro"]
+    auc = metrics["roc_auc"]
+    sensitivity = metrics["sensitivity"]
+    specificity = metrics["specificity"]
+
     print("\n--- 分类报告 ---")
-    print(classification_report(all_labels, all_preds))
+    print(classification_report(predictions["y_true"], predictions["y_pred"], zero_division=0))
     print("混淆矩阵:")
-    print(confusion_matrix(all_labels, all_preds))
+    print(confusion_matrix(predictions["y_true"], predictions["y_pred"], labels=[0, 1]))
+    print(
+        "Clinical metrics: "
+        f"PPV={metrics['ppv']:.4f}, NPV={metrics['npv']:.4f}, "
+        f"PR-AUC={metrics['pr_auc']:.4f}, Brier={metrics['brier_score']:.4f}"
+    )
+    if return_details:
+        return metrics, predictions
     return acc, f1, auc, sensitivity, specificity
 
 

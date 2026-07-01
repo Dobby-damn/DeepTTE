@@ -552,7 +552,7 @@ def main():
 
     batch_size = 32
     hidden_size = 64
-    num_epochs = 200
+    num_epochs = 20
     learning_rate = 3e-4
     dropout = 0.4
     input_size = 9  # 2（ex, ey）
@@ -583,10 +583,11 @@ def main():
         random_state=10,
         stratify=[labels[i] for i in temp_idx]
     )
-    train_sampler = BucketBatchSampler(torch.utils.data.Subset(dataset, train_idx), batch_size) #按照长度分组
+    train_subset = torch.utils.data.Subset(dataset, train_idx)
+    train_sampler = BucketBatchSampler(train_subset, batch_size) #按照长度分组
 
     train_loader = DataLoader(
-        dataset,
+        train_subset,
         batch_sampler = train_sampler,
         # batch_size = batch_size,
         # shuffle = True,
@@ -608,7 +609,7 @@ def main():
     # ---------------------------------- Model & Optim ----------------------------------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = len(dataset.label_encoder.classes_)
-    torch.backends.cudnn.enabled = False
+    torch.backends.cudnn.enabled = True
     # infer static feature dimension from dataset (prevents mismatch / leakage)
     inferred_static_dim = int(dataset.static_features_scaled.shape[1])
     print(f"[Info] Inferred static feature dim: {inferred_static_dim}")
@@ -737,8 +738,9 @@ def main():
     del train_loader
     del test_loader
     del val_loader
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 if __name__ == "__main__":

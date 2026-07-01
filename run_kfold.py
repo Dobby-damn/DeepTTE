@@ -1,106 +1,220 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
 import numpy as np
-from sklearn.model_selection import KFold, StratifiedKFold, train_test_split 
+import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Subset
-# 引入你现有的模块
-from DSTLF import ParquetDataset, collate_fn, BucketBatchSampler, train, evaluate 
-import models.DeepTTE as DeepTTE
-import models.Baseline_LSTM as BaselineLSTM
-import models.Baseline_Transformer as BaselineTransformer
-import models.Baseline_LITEMV as BaselineLITEMV
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from torch.utils.data import DataLoader
 
 import logger
+import models.Baseline_LITEMV as BaselineLITEMV
+import models.Baseline_LSTM as BaselineLSTM
+import models.Baseline_Transformer as BaselineTransformer
+import models.DeepTTE as DeepTTE
+from DSTLF import BucketBatchSampler, ParquetDataset, collate_fn, evaluate, train
+from evaluation.calibration import calibration_table, decision_curve_table
+from evaluation.metrics import compute_binary_metrics, summarize_metric_dicts
+from evaluation.subgroup import evaluate_default_subgroups
 
-def run_k_fold(file_path, k=5, batch_size=32, epochs=50):
-    # 1. 加载全量数据
-    # 注意：这里不需要归一化，归一化最好在 fold 内部做，但为了简化，全局归一化也可接受
-    full_dataset = ParquetDataset(file_path=file_path, normalize=True)
-    df = full_dataset.df
 
-    id_label_map = df.groupby('evaluation_id')['diagnose'].first()
-    all_ids = np.array(sorted(id_label_map.index.tolist()))
+def build_model(model_name: str):
+    model_name = model_name.lower()
+    if model_name == "dstlf":
+        return DeepTTE.Net(
+            num_classes=2,
+            num_filter=32,
+            hidden_size=48,
+            num_fc_layers=1,
+            dropout_p=0.5,
+        )
+    if model_name == "bilstm":
+        return BaselineLSTM.Net(num_classes=2, hidden_size=48, dropout_p=0.5)
+    if model_name == "transformer":
+        return BaselineTransformer.Net(num_classes=2, d_model=64, num_layers=2, dropout_p=0.5)
+    if model_name == "litemv":
+        return BaselineLITEMV.Net(num_classes=2, dropout_p=0.5)
+    raise ValueError(f"Unknown model_name={model_name}. Choose from dstlf, bilstm, transformer, litemv.")
+
+
+def make_fold_dataset(raw_df: pd.DataFrame, ids, normalizer=None, fit_normalizer=False):
+    fold_df = raw_df[raw_df["evaluation_id"].isin(ids)].copy()
+    return ParquetDataset(
+        dataframe=fold_df,
+        normalize=True,
+        normalizer=normalizer,
+        fit_normalizer=fit_normalizer,
+    )
+
+
+def make_loader(dataset, batch_size: int, *, train_mode: bool):
+    if train_mode:
+        sampler = BucketBatchSampler(dataset, batch_size)
+        return DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_fn)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+
+
+def split_train_val_ids(train_ids, id_label_map, *, val_ratio=0.2, seed=10):
+    train_labels = np.array([id_label_map[subj_id] for subj_id in train_ids])
+    fold_train_ids, fold_val_ids = train_test_split(
+        train_ids,
+        test_size=val_ratio,
+        random_state=seed,
+        stratify=train_labels,
+    )
+    return np.array(fold_train_ids), np.array(fold_val_ids)
+
+
+def run_k_fold(
+    file_path,
+    *,
+    model_name="dstlf",
+    k=5,
+    batch_size=32,
+    epochs=50,
+    lr=1e-3,
+    output_dir="outputs/acm_health_eval",
+    seed=10,
+    device=None,
+    bootstrap_iters=2000,
+):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    raw_dataset = ParquetDataset(file_path=file_path, normalize=False)
+    raw_df = raw_dataset.raw_df.copy()
+    id_label_map = raw_df.groupby("evaluation_id")["diagnose"].first().to_dict()
+    all_ids = np.array(sorted(id_label_map.keys()))
     id_labels = np.array([id_label_map[subj_id] for subj_id in all_ids])
-    # 2. 获取所有唯一的 Subject ID
-    #all_ids = np.array(sorted(full_dataset.df['evaluation_id'].unique().tolist()))
-    
-    # 3. K-Fold 分割器
-    kf = KFold(n_splits=k, shuffle=True, random_state=10)
-    
-    acc_list, f1_list, auc_list, sens_list, spec_list = [], [], [], [], [] # 记录每一折的结果
-    
-    print(f"🚀 开始 {k}-Fold 交叉验证...")
-    
-    for fold, (train_idx_ids, test_idx_ids) in enumerate(kf.split(all_ids, id_labels)):
-        print(f"\n========== Fold {fold+1}/{k} ==========")
-        
-        # 获取当前折的 ID
+
+    splitter = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+    fold_metrics = []
+    prediction_frames = []
+
+    for fold, (train_idx_ids, test_idx_ids) in enumerate(splitter.split(all_ids, id_labels), start=1):
+        print(f"\n========== Fold {fold}/{k} | model={model_name} ==========")
         fold_train_ids = all_ids[train_idx_ids]
         fold_test_ids = all_ids[test_idx_ids]
-
-        fold_train_labels_all = id_labels[train_idx_ids]
-        
-        # 进一步从 Training IDs 中分出 Validation IDs (用于早停)
-        # 比如取 20% 做 Val
-
-        fold_train_ids, fold_val_ids = train_test_split(fold_train_ids, test_size=0.2, random_state=10, stratify=fold_train_labels_all)
-        
-        # 映射回 DataFrame 的索引 (Indices)
-        train_indices = full_dataset.df.index[full_dataset.df['evaluation_id'].isin(fold_train_ids)].tolist()
-        val_indices = full_dataset.df.index[full_dataset.df['evaluation_id'].isin(fold_val_ids)].tolist()
-        test_indices = full_dataset.df.index[full_dataset.df['evaluation_id'].isin(fold_test_ids)].tolist()
-        
-        # 构建 Subset
-        train_set = Subset(full_dataset, train_indices)
-        val_set = Subset(full_dataset, val_indices)
-        test_set = Subset(full_dataset, test_indices)
-        
-        # 构建 Loader (Train用分桶，Val/Test不用)
-        train_sampler = BucketBatchSampler(train_set, batch_size)
-        train_loader = DataLoader(train_set, batch_sampler=train_sampler, collate_fn=collate_fn)
-        val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-        test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-        
-        # 初始化模型 (每一折都要重新初始化！)
-        model = DeepTTE.Net(
-            num_classes=2, 
-            num_filter=32, 
-            hidden_size=48, 
-            num_fc_layers=1, 
-            dropout_p=0.5
+        fold_train_ids, fold_val_ids = split_train_val_ids(
+            fold_train_ids,
+            id_label_map,
+            val_ratio=0.2,
+            seed=seed,
         )
-        # 实验 B: 跑 Vanilla BiLSTM 基线
-        # model = BaselineLSTM.Net(num_classes=2, hidden_size=48, dropout_p=0.5)
-        # 实验 C: 跑 Transformer 基线
-        # model = BaselineTransformer.Net(num_classes=2, d_model=64, num_layers=2, dropout_p=0.5)
-        # 实验 D: 跑 LITEMV 基线
-        model = BaselineLITEMV.Net(num_classes=2, dropout_p=0.5)
-        # 初始化 Logger
-        elogger = logger.Logger(f"run_log_fold_{fold+1}")
-        
-        # 训练 (复用你现有的 train 函数)
-        # 注意：train 函数内部必须包含 load_best_model 的逻辑
-        train(model, elogger, train_loader, val_loader, test_loader, epochs, batch_size, lr=5e-3)
-        
-        # 加载本折的最优模型进行测试
-        model.load_state_dict(torch.load("best_model.pth")) # 假设 train 函数保存为这个名字
-        acc, f1, auc, sens, spec = evaluate(model, test_loader, device=torch.device('cuda'))
-        #acc, f1 = evaluate(model, test_loader, device=torch.device('cuda'))
-        
-        print(f"✅ Fold {fold+1} Result: Acc={acc:.4f}, F1={f1:.4f}, AUC={auc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}")
-        acc_list.append(acc)
-        f1_list.append(f1)
-        auc_list.append(auc)
-        sens_list.append(sens)
-        spec_list.append(spec)
 
-    # 输出平均结果
-    print("📊 DSTLF (Ours) 5-Fold CV 最终结果 (均值 ± 标准差):")
-    print(f"Accuracy    : {np.mean(acc_list):.4f} ± {np.std(acc_list):.4f}")
-    print(f"Sensitivity : {np.mean(sens_list):.4f} ± {np.std(sens_list):.4f}")
-    print(f"Specificity : {np.mean(spec_list):.4f} ± {np.std(spec_list):.4f}")
-    print(f"F1-Score    : {np.mean(f1_list):.4f} ± {np.std(f1_list):.4f}")
-    print(f"AUC         : {np.mean(auc_list):.4f} ± {np.std(auc_list):.4f}")
-    print("=======================================================")
+        train_dataset = make_fold_dataset(raw_df, fold_train_ids, fit_normalizer=True)
+        normalizer = train_dataset.get_normalizer()
+        val_dataset = make_fold_dataset(raw_df, fold_val_ids, normalizer=normalizer, fit_normalizer=False)
+        test_dataset = make_fold_dataset(raw_df, fold_test_ids, normalizer=normalizer, fit_normalizer=False)
+
+        train_loader = make_loader(train_dataset, batch_size, train_mode=True)
+        val_loader = make_loader(val_dataset, batch_size, train_mode=False)
+        test_loader = make_loader(test_dataset, batch_size, train_mode=False)
+
+        model = build_model(model_name)
+        elogger = logger.Logger(f"run_log_{model_name}_fold_{fold}")
+        checkpoint_path = output_dir / f"{model_name}_fold_{fold}_best.pth"
+
+        train(
+            model,
+            elogger,
+            train_loader,
+            val_loader,
+            test_loader,
+            epochs,
+            batch_size,
+            lr=lr,
+            device=device,
+            checkpoint_path=checkpoint_path,
+            evaluate_test=False,
+        )
+
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        metrics, predictions = evaluate(model, test_loader, device=device, return_details=True)
+        metrics["fold"] = fold
+        metrics["validation_scope"] = "internal_subject_level_cross_validation"
+        fold_metrics.append(metrics)
+
+        predictions["fold"] = fold
+        predictions["model"] = model_name
+        prediction_frames.append(predictions)
+        predictions.to_csv(output_dir / f"{model_name}_fold_{fold}_predictions.csv", index=False)
+
+        print(
+            f"Fold {fold}: "
+            f"Acc={metrics['accuracy']:.4f}, AUC={metrics['roc_auc']:.4f}, "
+            f"PR-AUC={metrics['pr_auc']:.4f}, Sens={metrics['sensitivity']:.4f}, "
+            f"Spec={metrics['specificity']:.4f}, PPV={metrics['ppv']:.4f}, NPV={metrics['npv']:.4f}"
+        )
+
+    metrics_df = pd.DataFrame(fold_metrics)
+    all_predictions = pd.concat(prediction_frames, ignore_index=True)
+    summary_df = summarize_metric_dicts(fold_metrics)
+    pooled_metrics = compute_binary_metrics(
+        all_predictions["y_true"],
+        all_predictions["y_prob"],
+        bootstrap_iters=bootstrap_iters,
+        random_state=seed,
+    )
+    pooled_metrics["model"] = model_name
+    pooled_metrics["validation_scope"] = "internal_subject_level_cross_validation"
+    pooled_metrics_df = pd.DataFrame([pooled_metrics])
+    subgroup_df = evaluate_default_subgroups(all_predictions, min_count=10)
+    calibration_df = calibration_table(all_predictions["y_true"], all_predictions["y_prob"])
+    decision_curve_df = decision_curve_table(all_predictions["y_true"], all_predictions["y_prob"])
+
+    metrics_df.to_csv(output_dir / f"{model_name}_fold_metrics.csv", index=False)
+    summary_df.to_csv(output_dir / f"{model_name}_summary_metrics.csv", index=False)
+    pooled_metrics_df.to_csv(output_dir / f"{model_name}_pooled_metrics_with_ci.csv", index=False)
+    all_predictions.to_csv(output_dir / f"{model_name}_all_predictions.csv", index=False)
+    subgroup_df.to_csv(output_dir / f"{model_name}_subgroup_metrics.csv", index=False)
+    calibration_df.to_csv(output_dir / f"{model_name}_calibration_table.csv", index=False)
+    decision_curve_df.to_csv(output_dir / f"{model_name}_decision_curve.csv", index=False)
+
+    print("\nInternal cross-validation summary:")
+    print(summary_df)
+    print(
+        "\nNote: No independent external validation cohort is available in this project. "
+        "These results should be described as subject-level internal cross-validation."
+    )
+    return {
+        "fold_metrics": metrics_df,
+        "summary": summary_df,
+        "pooled_metrics": pooled_metrics_df,
+        "predictions": all_predictions,
+        "subgroups": subgroup_df,
+        "calibration": calibration_df,
+        "decision_curve": decision_curve_df,
+    }
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run subject-level k-fold evaluation for DSTLF and baselines.")
+    parser.add_argument("--file-path", default="data2.parquet")
+    parser.add_argument("--model-name", default="dstlf", choices=["dstlf", "bilstm", "transformer", "litemv"])
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--output-dir", default="outputs/acm_health_eval")
+    parser.add_argument("--seed", type=int, default=10)
+    parser.add_argument("--bootstrap-iters", type=int, default=2000)
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    run_k_fold("data2.parquet") # 替换你的路径
+    args = parse_args()
+    run_k_fold(
+        args.file_path,
+        model_name=args.model_name,
+        k=args.folds,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        output_dir=args.output_dir,
+        seed=args.seed,
+        bootstrap_iters=args.bootstrap_iters,
+    )
